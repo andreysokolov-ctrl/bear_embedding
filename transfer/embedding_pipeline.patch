@@ -1,0 +1,1979 @@
+From 48f956618a5bd3b52bb1b3000d4e3cbdbacdfb94 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Thu, 5 Nov 2026 22:41:24 +0500
+Subject: [PATCH 1/2] feat: integrate embedding pipeline with parsing and
+ retrieval contracts
+
+---
+ .github/workflows/embedding.yml               |  13 +
+ .gitlab-ci.yml                                |   8 +
+ README.md                                     |   4 +
+ README_EMBEDDING.md                           | 177 +++++++++++
+ bear-fusion-lab/tests/test_demo_resources.py  |  10 +
+ .../src/bear_text_beta/bootstrap.py           |  14 +-
+ bear-text-beta/src/bear_text_beta/cli.py      |   3 +-
+ .../src/bear_text_beta/embedding_pipeline.py  | 280 ++++++++++++++++++
+ .../src/bear_text_beta/model_profiles.py      |  15 +
+ .../src/bear_text_beta/retrieval_metrics.py   |  63 ++++
+ bear-text-beta/src/bear_text_beta/runtime.py  |  22 +-
+ .../tests/test_deep_architecture.py           |   5 +-
+ .../tests/test_embedding_pipeline.py          | 217 ++++++++++++++
+ bear-text-beta/tests/test_model_profiles.py   |  53 ++++
+ .../tests/test_retrieval_metrics.py           |  40 +++
+ docs/embedding/architecture.md                |  64 ++++
+ docs/embedding/deepseek_review.md             |  43 +++
+ docs/embedding/merge_plan.md                  |  85 ++++++
+ docs/embedding/validation.md                  |  60 ++++
+ examples/embedding_pipeline_demo.py           |  69 +++++
+ examples/smoke_external.py                    |  59 ++++
+ examples/ssl.txt                              |   4 +
+ requirements.verified.txt                     |  64 ++++
+ 23 files changed, 1360 insertions(+), 12 deletions(-)
+ create mode 100644 .github/workflows/embedding.yml
+ create mode 100644 .gitlab-ci.yml
+ create mode 100644 README_EMBEDDING.md
+ create mode 100644 bear-text-beta/src/bear_text_beta/embedding_pipeline.py
+ create mode 100644 bear-text-beta/src/bear_text_beta/model_profiles.py
+ create mode 100644 bear-text-beta/src/bear_text_beta/retrieval_metrics.py
+ create mode 100644 bear-text-beta/tests/test_embedding_pipeline.py
+ create mode 100644 bear-text-beta/tests/test_model_profiles.py
+ create mode 100644 bear-text-beta/tests/test_retrieval_metrics.py
+ create mode 100644 docs/embedding/architecture.md
+ create mode 100644 docs/embedding/deepseek_review.md
+ create mode 100644 docs/embedding/merge_plan.md
+ create mode 100644 docs/embedding/validation.md
+ create mode 100644 examples/embedding_pipeline_demo.py
+ create mode 100644 examples/smoke_external.py
+ create mode 100644 examples/ssl.txt
+ create mode 100644 requirements.verified.txt
+
+diff --git a/.github/workflows/embedding.yml b/.github/workflows/embedding.yml
+new file mode 100644
+index 0000000..d6779db
+--- /dev/null
++++ b/.github/workflows/embedding.yml
+@@ -0,0 +1,13 @@
++name: BEAR embedding contracts
++on: [push, pull_request]
++jobs:
++  test:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - uses: actions/setup-python@v5
++        with:
++          python-version: '3.12'
++      - run: python -m pip install -e './bear-text-beta[dev]'
++      - run: python -m pytest bear-text-beta/tests -q
++      - run: python examples/embedding_pipeline_demo.py
+diff --git a/.gitlab-ci.yml b/.gitlab-ci.yml
+new file mode 100644
+index 0000000..ca38321
+--- /dev/null
++++ b/.gitlab-ci.yml
+@@ -0,0 +1,8 @@
++image: python:3.12-slim
++stages: [test]
++embedding-contracts:
++  stage: test
++  script:
++    - python -m pip install -e './bear-text-beta[dev]'
++    - python -m pytest bear-text-beta/tests -q
++    - python examples/embedding_pipeline_demo.py
+diff --git a/README.md b/README.md
+index e00e60c..e983b45 100644
+--- a/README.md
++++ b/README.md
+@@ -91,3 +91,7 @@ py -3.12 -m venv bear-text-beta/.venv
+ Fusion — бета: `accepted_for_indexing=false`, локальный поиск — BM25, генерация ответов и работающий сквозной Qdrant-пайплайн в демо не реализованы. Качество сложных PDF-таблиц, рисунков и чисел OCR требует проверки. Семантическое разбиение с реальными E5-векторами проверено на небольшой контрольной выборке; это не оценка качества на всех документах.
+ 
+ Исходный отчёт о тестах и сравнении версий — [FINAL_INTEGRATION_REPORT.md](bear-fusion-lab/FINAL_INTEGRATION_REPORT.md). Часть исследовательских скриптов и корпусов из исходного рабочего окружения в эту публикацию не включена; ссылки отчёта на них могут быть недоступны.
++# Модуль эмбеддинга
++
++Класс `EmbeddingPipeline`, интеграция с этим блоком, примеры запуска и подготовка переноса:
++[README_EMBEDDING.md](README_EMBEDDING.md).
+diff --git a/README_EMBEDDING.md b/README_EMBEDDING.md
+new file mode 100644
+index 0000000..aa107a2
+--- /dev/null
++++ b/README_EMBEDDING.md
+@@ -0,0 +1,177 @@
++# BEAR: получение текста, сбор запроса, векторизация
++
++Реализация: `bear-text-beta/src/bear_text_beta/embedding_pipeline.py`, класс **EmbeddingPipeline**.
++Автор задачи: Соколов Андрей Викторович, ЕТ-212.
++
++Сборка основана на [BEAR_Chanking-Parsing](https://github.com/IRelapseIT/BEAR_Chanking-Parsing),
++commit `c2447d4ff89cb0f5e33006d505e6d0243930c292`. Оба исходных пакета сохранены.
++Изменения подготовлены в ветке `feature/embedding-pipeline` поверх этого commit.
++
++## Что делает класс
++
++У документов и вопросов два входа в одну embedding-модель:
++
++1. Документы: `ProcessingResult.chunks[].embedding_text` -> пакетная векторизация -> `EmbeddedChunk[]`.
++2. Вопрос: исходный текст -> NFC и нормализация пробелов -> необязательное преобразование -> вектор.
++
++Документ не превращается в поисковый вопрос. Парсинг и чанкинг выполняет предыдущий блок.
++Заголовки/breadcrumbs уже находятся в `embedding_text`; второй раз они не добавляются.
++`Chunk.text`, `source_spans`, порядок чанков, ID, вложения и метаданные сохраняются.
++
++Модель живёт во внешнем **Infinity**. Python-класс использует `EmbeddingProvider`, проверяет
++размерность/NaN/Inf/нулевые векторы, нормализует L2 и не обрезает вход молча.
++Qdrant, активацией поколений и фильтрами пространства продолжает управлять `IndexingService`.
++
++## Установка и проверка без GPU
++
++Python **3.12** (требование предыдущего блока). Из корня проекта:
++
++Для воспроизведения проверенного окружения после создания venv можно сначала выполнить
++`python -m pip install -r requirements.verified.txt`. Это зафиксированные наблюдённые версии,
++не веса моделей; обычная установка ниже использует диапазоны зависимостей upstream.
++
++```bash
++python -m venv .venv
++# Linux/macOS:
++source .venv/bin/activate
++# Windows PowerShell: .venv\Scripts\Activate.ps1
++python -m pip install -e "./bear-text-beta[dev]" -e "./bear-fusion-lab[demo,acceptance]"
++python -m pytest bear-text-beta/tests -q
++# Для полной проверки upstream Fusion нужен только токенизатор E5, без весов:
++bear --model-dir bear-text-beta/models/e5 prepare-model
++python -m pytest bear-fusion-lab/tests -q
++python examples/embedding_pipeline_demo.py
++```
++
++Демо использует явно обозначенные тестовые векторы и HTTP-заглушки. Оно проверяет сборку и
++контракты, **не** качество модели. Для запуска этих проверок модели скачивать не нужно.
++Полные upstream-тесты Fusion отдельно используют токенизатор E5 и зависимости PDF/OCR из extras;
++OCR-проверки также требуют системный Tesseract. Минимальный core/новый модуль проверяются без них.
++
++## Настоящий инференс и Qdrant
++
++Подготовить токенизатор с фиксацией ревизии (веса без `--weights` не скачиваются):
++
++```bash
++bear --model-dir models/bge-m3 prepare-model --model bge-m3
++```
++
++При необходимости загрузить и веса в тот же каталог:
++
++```bash
++bear --model-dir models/bge-m3 prepare-model --model bge-m3 --weights
++```
++
++Развернуть Infinity по [официальной документации](https://github.com/michaelfeil/infinity),
++загрузить **ту же закреплённую ревизию** BAAI/bge-m3. Сервис должен предоставлять
++`GET /v1/models` и `POST /v1/embeddings`. Его точное served-model ID указать в конфигурации.
++Модель/ревизия сервера - обязанность конфигурации развёртывания: одного `/models` недостаточно,
++чтобы доказать совпадение весов с локальным tokenizer manifest.
++
++Для Linux/macOS:
++
++```bash
++export BEAR_MODEL_DIR=models/bge-m3
++export BEAR_INFINITY_URL=http://127.0.0.1:7997/v1
++export BEAR_INFINITY_MODEL=BAAI/bge-m3
++export BEAR_QDRANT_URL=http://127.0.0.1:6333
++export BEAR_QDRANT_COLLECTION=bear_bge_m3_pipeline_v1
++```
++
++В PowerShell использовать `$env:BEAR_MODEL_DIR="models/bge-m3"` и аналогично для остальных.
++Не выставлять `BEAR_OFFLINE=1` / `BEAR_TEST_COUNTER=1` для реальной индексации.
++Для удалённых сервисов заменить адреса. В Colab `localhost` относится к машине Colab,
++а не к домашнему компьютеру. API-ключи: `BEAR_INFINITY_API_KEY` / `BEAR_QDRANT_API_KEY`.
++
++Пройти существующий путь обработки:
++
++```bash
++bear --model-dir models/bge-m3 process examples/ssl.txt --document ssl-guide --mode token --output state/ssl.json
++bear --model-dir models/bge-m3 index state/ssl.json
++bear --model-dir models/bge-m3 search "Как настроить SSL?" --top-k 50
++```
++
++Встроенный TXT/HTML/DOCX-контур предыдущего блока по умолчанию требует настроенный Dedoc;
++его запуск описан в `bear-text-beta/README.md`. Демо выше использует реальный локальный TXTParser.
++
++После запуска сервисов можно выполнить отдельный smoke-test:
++
++```bash
++python examples/smoke_external.py --model-dir models/bge-m3
++```
++
++Он создаёт небольшой документ в отдельном тестовом пространстве/коллекции. Качество на RuBQ
++этот smoke-test не измеряет. Модели и внешние сервисы не были запущены при локальной проверке пакета.
++
++## Использование класса
++
++```python
++from pathlib import Path
++from bear_text_beta.embedding_pipeline import EmbeddingPipeline, MemoryVectorCache
++from bear_text_beta.embeddings import HFTokenCounter, InfinityEmbeddingProvider, load_profile
++
++profile = load_profile(Path("models/bge-m3"))
++counter = HFTokenCounter(Path("models/bge-m3"), profile)
++provider = InfinityEmbeddingProvider(
++    "http://127.0.0.1:7997/v1", profile, counter,
++    server_model="BAAI/bge-m3", max_tokens=480,
++)
++with EmbeddingPipeline(provider, counter, profile, max_tokens=480,
++                       cache=MemoryVectorCache(4096)) as pipeline:
++    prepared = pipeline.vectorize_query("  Как\n настроить SSL? ")
++    print(prepared.query.original, prepared.query.text)
++    print(len(prepared.vector), prepared.embedding_profile_id)
++    # result = ProcessingResult от парсера/чанкера того же профиля
++    # embedded_chunks = pipeline.vectorize_chunks(result)
++```
++
++В `Services` класс уже подключён автоматически для реального инференса; отдельная подмена
++`IndexingService` не требуется. Его метод `search()` теперь строит запрос через пайплайн.
++`embed(text)` совместим со схемой презентации, `embed_batch(texts, purpose)` - с кодом предыдущего блока.
++Для FastAPI есть `await pipeline.aembed(text)`: sync HTTP выносится в поток; вызовы одного экземпляра
++сериализуются. Для высокой нагрузки нужен отдельный пул/асинхронный провайдер.
++
++`PreparedQuery` содержит original/normalized/text/token_count/builder_version.
++Текст в общие логи выводится только с `log_query_text=True`; trace доступен вызывающему коду всегда.
++`on_event` получает счётчики и время векторизации без содержимого запросов.
++Это время **не** включает поиск Qdrant или реранкер.
++Ошибка пользовательского `on_event` передаётся вызывающему коду: обработчик должен быть надёжным.
++
++Кэш опциональный, ограниченный, в памяти процесса: после перезапуска пуст.
++Ключ включает профиль/ревизии/префиксы, назначение (`query`/`document`/`similarity`),
++лимит и точный подготовленный текст. Совпадающие строки внутри батча вычисляются один раз.
++Можно реализовать `VectorCache` для Redis, не меняя класс.
++
++## Модели и качество
++
++Шаблон BGE-M3: 1024 dense-компоненты, без `query:`/`passage:` префиксов.
++512 токенов - выбранный рабочий предел профиля, 480 - бюджет текущего рантайма.
++Предел самой BGE-M3 - 8192; увеличение бюджета требует согласования чанкинга и профиля.
++Прежний E5-small (384, `query:`/`passage:`) сохранён для совместимости.
++Менять модель для запроса без переиндексации корпуса нельзя.
++
++По предыдущему тесту RuBQ предварительно выбрана связка BGE-M3 + BGE-reranker-v2-m3.
++Реранкинг находится после retrieval и в текущую задачу класса не включён.
++Новый модуль сам по себе не доказывает улучшение nDCG. Новый RuBQ-прогон здесь не выполнялся.
++
++Метрики для передачи следующему блоку:
++
++```python
++from bear_text_beta.retrieval_metrics import evaluate_rankings
++report = evaluate_rankings(
++    rankings={"q1": ["chunk-a", "chunk-b"]},
++    qrels={"q1": {"chunk-b": 1}},
++    latencies_ms={"q1": 15.2},
++)
++```
++
++Считаются nDCG@10, MRR@10, Recall@50, p50/p95. Передавать ранжирование всех кандидатов до 50,
++даже если показываются только первые 10. ID в qrels и выдаче должны относиться к одному уровню:
++чанк либо документ. Нельзя сравнивать старые RuBQ paragraph-ID с новыми chunk-ID без remapping.
++
++Документация:
++
++- [Контракты и архитектура](docs/embedding/architecture.md)
++- [Разбор рекомендаций DeepSeek](docs/embedding/deepseek_review.md)
++- [Слияние, GitHub и GitLab](docs/embedding/merge_plan.md)
++- [Результаты проверки](docs/embedding/validation.md)
+diff --git a/bear-fusion-lab/tests/test_demo_resources.py b/bear-fusion-lab/tests/test_demo_resources.py
+index 7f1671b..900515a 100644
+--- a/bear-fusion-lab/tests/test_demo_resources.py
++++ b/bear-fusion-lab/tests/test_demo_resources.py
+@@ -2,8 +2,18 @@ import importlib.util
+ import json
+ from pathlib import Path
+ 
++import psutil
++import pytest
++
+ 
+ def test_actual_worker_stopped_on_memory_budget(tmp_path):
++    # Sandboxed runners may expose no OS process table to psutil. Such an
++    # environment cannot verify RSS enforcement; do not report a false failure.
++    try:
++        if psutil.Process().memory_info().rss <= 0:
++            pytest.skip("Host process RSS is unavailable in this runner")
++    except (psutil.NoSuchProcess, psutil.AccessDenied):
++        pytest.skip("Host process table is unavailable in this runner")
+     root = Path(__file__).resolve().parents[1]
+     spec = importlib.util.spec_from_file_location("demo_test", root / "demo.py")
+     demo = importlib.util.module_from_spec(spec)
+diff --git a/bear-text-beta/src/bear_text_beta/bootstrap.py b/bear-text-beta/src/bear_text_beta/bootstrap.py
+index ee2b467..f5eed9c 100644
+--- a/bear-text-beta/src/bear_text_beta/bootstrap.py
++++ b/bear-text-beta/src/bear_text_beta/bootstrap.py
+@@ -2,26 +2,30 @@ import hashlib
+ import importlib.metadata
+ import json
+ import subprocess
+-from dataclasses import asdict
++from dataclasses import asdict, replace
+ from pathlib import Path
+ 
+ from .errors import ValidationError
+-from .models import EmbeddingProfile
+ 
+ 
+-def prepare_model(destination: Path, *, weights=False):
++def prepare_model(destination: Path, *, weights=False, model="e5-small"):
+     from huggingface_hub import HfApi, snapshot_download
++
++    from .model_profiles import model_profile
++    template = model_profile(model)
+     manifest = destination / "bear-model.json"
+     if manifest.exists():
+         from .embeddings import load_profile
+         profile = load_profile(destination)
++        if profile.model_id != template.model_id:
++            raise ValidationError("Model directory belongs to another model; choose a new directory")
+         revision = profile.model_revision
+         if not weights:
+             return {"model_revision": revision, "status": "already_prepared"}
+     else:
+-        profile = EmbeddingProfile()
++        profile = template
+         revision = HfApi().model_info(profile.model_id, token=False).sha
+-        profile = EmbeddingProfile(model_revision=revision, tokenizer_revision=revision)
++        profile = replace(profile, model_revision=revision, tokenizer_revision=revision)
+     patterns = ["*.json", "*.model", "tokenizer*", "vocab*", "special_tokens_map.json"]
+     if weights:
+         patterns.append("*.safetensors")
+diff --git a/bear-text-beta/src/bear_text_beta/cli.py b/bear-text-beta/src/bear_text_beta/cli.py
+index 6d06412..e3fbb0e 100644
+--- a/bear-text-beta/src/bear_text_beta/cli.py
++++ b/bear-text-beta/src/bear_text_beta/cli.py
+@@ -48,6 +48,7 @@ def main(argv=None):
+     compare.add_argument("right", type=Path)
+     prepare = sub.add_parser("prepare-model")
+     prepare.add_argument("--weights", action="store_true")
++    prepare.add_argument("--model", choices=["e5-small", "bge-m3"], default="e5-small")
+     freeze = sub.add_parser("lock")
+     freeze.add_argument("--output", type=Path, default=Path("requirements.lock"))
+     images = sub.add_parser("prepare-images")
+@@ -59,7 +60,7 @@ def main(argv=None):
+     runtime = None
+     try:
+         if args.command == "prepare-model":
+-            print_json(prepare_model(Path(args.model_dir), weights=args.weights))
++            print_json(prepare_model(Path(args.model_dir), weights=args.weights, model=args.model))
+             return 0
+         if args.command == "prepare-images":
+             prepare_images(args.output)
+diff --git a/bear-text-beta/src/bear_text_beta/embedding_pipeline.py b/bear-text-beta/src/bear_text_beta/embedding_pipeline.py
+new file mode 100644
+index 0000000..f6c3622
+--- /dev/null
++++ b/bear-text-beta/src/bear_text_beta/embedding_pipeline.py
+@@ -0,0 +1,280 @@
++"""Application layer between parsed chunks, query building and embedding inference.
++
++No model weights, parsing logic or vector database ownership lives here.
++The class implements the existing EmbeddingProvider protocol.
++"""
++
++import asyncio
++import hashlib
++import json
++import logging
++import math
++import threading
++import time
++import unicodedata
++from collections import OrderedDict
++from dataclasses import dataclass
++from typing import Callable, Protocol
++
++from .embeddings import validate_vectors
++from .errors import EmbeddingError, ValidationError
++from .models import EmbeddedChunk, EmbeddingProfile, ProcessingResult
++from .ports import EmbeddingProvider, TokenCounter
++
++
++@dataclass(frozen=True)
++class PreparedQuery:
++    original: str
++    normalized: str
++    text: str
++    token_count: int
++    builder_version: str
++
++
++@dataclass(frozen=True)
++class VectorizedQuery:
++    query: PreparedQuery
++    vector: list[float]
++    embedding_profile_id: str
++    elapsed_ms: float
++
++
++@dataclass(frozen=True)
++class EmbeddingEvent:
++    purpose: str
++    input_count: int
++    cache_hits: int
++    inferred_count: int
++    elapsed_ms: float
++    embedding_profile_id: str
++
++
++class VectorCache(Protocol):
++    def get(self, key: str) -> list[float] | None: ...
++    def put(self, key: str, vector: list[float]) -> None: ...
++
++
++class MemoryVectorCache:
++    """Bounded per-process LRU. Stores vectors, never source text or search hits."""
++
++    def __init__(self, capacity: int = 4096):
++        if type(capacity) is not int or capacity < 1:
++            raise ValueError("Cache capacity must be a positive integer")
++        self.capacity = capacity
++        self._items = OrderedDict()
++        self._lock = threading.RLock()
++
++    def get(self, key):
++        with self._lock:
++            value = self._items.get(key)
++            if value is None:
++                return None
++            self._items.move_to_end(key)
++            return list(value)
++
++    def put(self, key, vector):
++        with self._lock:
++            self._items[key] = tuple(vector)
++            self._items.move_to_end(key)
++            while len(self._items) > self.capacity:
++                self._items.popitem(last=False)
++
++
++class EmbeddingPipeline:
++    """Receive ready text, build queries and produce validated unit dense vectors.
++
++    ``embed``/``embed_batch`` satisfy the presentation/provider contracts;
++    ``vectorize_chunks`` accepts the parser/chunker's actual ProcessingResult;
++    ``vectorize_query`` returns a reproducible trace for the metrics layer.
++
++    The injected provider adds model-specific prefixes exactly once. Documents
++    retain their embedding_text verbatim, including breadcrumbs and code layout.
++    """
++
++    VERSION = "embedding-pipeline-v1"
++
++    def __init__(
++        self,
++        provider: EmbeddingProvider,
++        counter: TokenCounter,
++        profile: EmbeddingProfile,
++        *,
++        batch_size: int = 16,
++        max_tokens: int | None = None,
++        cache: VectorCache | None = None,
++        query_transform: Callable[[str], str] | None = None,
++        builder_version: str = "nfc-whitespace-v1",
++        on_event: Callable[[EmbeddingEvent], None] | None = None,
++        log_query_text: bool = False,
++        logger: logging.Logger | None = None,
++    ):
++        if type(batch_size) is not int or batch_size < 1:
++            raise ValueError("batch_size must be a positive integer")
++        if type(profile.vector_dimension) is not int or profile.vector_dimension < 1:
++            raise ValueError("Invalid vector dimension")
++        if not profile.model_revision or not profile.tokenizer_revision:
++            raise ValidationError("Pin model and tokenizer revisions before vectorization")
++        if not builder_version or (query_transform and builder_version == "nfc-whitespace-v1"):
++            raise ValidationError("Custom query transforms need an explicit builder_version")
++        for component in (provider, counter):
++            actual = getattr(component, "profile", profile)
++            if actual != profile:
++                raise ValidationError("Provider, tokenizer and pipeline profiles differ")
++        budget = profile.max_input_tokens if max_tokens is None else max_tokens
++        if type(budget) is not int or budget < 1 or budget > profile.max_input_tokens:
++            raise ValueError("Invalid max_tokens")
++        if budget > getattr(provider, "max_tokens", budget):
++            raise ValidationError("Pipeline budget exceeds provider budget")
++        self.provider, self.counter, self.profile = provider, counter, profile
++        self.batch_size, self.max_tokens = batch_size, budget
++        self.cache = cache
++        self.query_transform = query_transform
++        self.builder_version = builder_version
++        self.on_event = on_event
++        self.log_query_text = log_query_text
++        self.logger = logger or logging.getLogger(__name__)
++        self._lock = threading.RLock()
++        self._closed = False
++
++    @property
++    def metrics(self):
++        """Preserve the upstream evaluator's inference-counter contract."""
++        return getattr(self.provider, "metrics", {})
++
++    def _check_open(self):
++        if self._closed:
++            raise EmbeddingError("EmbeddingPipeline is closed")
++
++    def _count(self, text, purpose):
++        if not isinstance(text, str) or not text.strip():
++            raise ValidationError("Embedding input must be non-empty text")
++        count = self.counter.full_count(text, purpose)
++        if count > self.max_tokens:
++            raise ValidationError(
++                f"{purpose} input has {count} tokens; limit is {self.max_tokens}; truncation is disabled"
++            )
++        return count
++
++    def build_query(self, text: str) -> PreparedQuery:
++        self._check_open()
++        if not isinstance(text, str):
++            raise ValidationError("Query must be text")
++        normalized = " ".join(unicodedata.normalize("NFC", text).split())
++        if not normalized:
++            raise ValidationError("Query is empty after normalization")
++        built = self.query_transform(normalized) if self.query_transform else normalized
++        count = self._count(built, "query")
++        trace = PreparedQuery(text, normalized, built, count, self.builder_version)
++        if self.log_query_text:
++            self.logger.info("BEAR query built", extra={"original_query": text, "prepared_query": built,
++                                                      "builder_version": self.builder_version})
++        return trace
++
++    def _key(self, text, purpose):
++        identity = [self.VERSION, self.profile.identifier(), self.max_tokens, "l2", purpose, text]
++        return hashlib.sha256(json.dumps(identity, ensure_ascii=False).encode("utf-8")).hexdigest()
++
++    def embed_batch(self, texts: list[str], purpose: str = "document") -> list[list[float]]:
++        self.profile.prefix(purpose)  # Reject unknown purpose even for an empty batch.
++        if not isinstance(texts, list):
++            raise ValidationError("texts must be a list")
++        prepared = [self.build_query(text).text for text in texts] if purpose == "query" else texts
++        for text in prepared:
++            self._count(text, purpose)
++        return self._encode(prepared, purpose)
++
++    def _encode(self, texts, purpose):
++        started = time.perf_counter()
++        with self._lock:
++            self._check_open()
++            keys = [self._key(text, purpose) for text in texts]
++            values, missing, hits = {}, {}, 0
++            for key, text in zip(keys, texts, strict=True):
++                if key in values or key in missing:
++                    continue
++                cached = self.cache.get(key) if self.cache is not None else None
++                if cached is None:
++                    missing[key] = text
++                else:
++                    validate_vectors([cached], 1, self.profile.vector_dimension)
++                    values[key] = self._unit(cached)
++            hits = sum(key in values for key in keys)
++            pending = list(missing.items())
++            # Validate and normalize the entire response before caching any batch.
++            for start in range(0, len(pending), self.batch_size):
++                batch = pending[start:start + self.batch_size]
++                vectors = self.provider.embed_batch([text for _, text in batch], purpose)
++                validate_vectors(vectors, len(batch), self.profile.vector_dimension)
++                normalized = [self._unit(vector) for vector in vectors]
++                for (key, _), vector in zip(batch, normalized, strict=True):
++                    values[key] = vector
++                    if self.cache is not None:
++                        self.cache.put(key, vector)
++            output = [list(values[key]) for key in keys]
++        event = EmbeddingEvent(purpose, len(texts), hits, len(pending),
++                               (time.perf_counter() - started) * 1000, self.profile.identifier())
++        if self.on_event:
++            self.on_event(event)
++        return output
++
++    @staticmethod
++    def _unit(vector):
++        norm = math.hypot(*(float(value) for value in vector))
++        if not math.isfinite(norm) or norm == 0:
++            raise EmbeddingError("Cannot normalize embedding vector")
++        return [float(value) / norm for value in vector]
++
++    def embed(self, text: str) -> list[float]:
++        return self.vectorize_query(text).vector
++
++    def vectorize_query(self, text: str) -> VectorizedQuery:
++        started = time.perf_counter()
++        query = self.build_query(text)
++        # Do not apply query_transform twice.
++        vector = self._encode([query.text], "query")[0]
++        return VectorizedQuery(query, vector, self.profile.identifier(),
++                               (time.perf_counter() - started) * 1000)
++
++    def vectorize_chunks(self, result: ProcessingResult) -> list[EmbeddedChunk]:
++        """Return downstream DTOs without changing chunks or activating a generation."""
++        if result.metrics.get("embedding_profile_id") != self.profile.identifier():
++            raise ValidationError("ProcessingResult was produced with another embedding profile")
++        if result.context != result.parsed_document.context:
++            raise ValidationError("ParsedDocument context mismatch")
++        if len({chunk.id for chunk in result.chunks}) != len(result.chunks):
++            raise ValidationError("Duplicate chunk identifiers")
++        vectors = self.embed_batch([chunk.embedding_text for chunk in result.chunks], "document")
++        return [EmbeddedChunk(chunk, vector, self.profile.identifier())
++                for chunk, vector in zip(result.chunks, vectors, strict=True)]
++
++    def vectorize_envelope(self, envelope: dict) -> list[EmbeddedChunk]:
++        """Honor FusionPipeline's explicit acceptance boundary; never approve it here."""
++        if (envelope.get("accepted_for_indexing") is not True
++                or envelope.get("source_fidelity") != "verified"):
++            raise ValidationError("Fusion result requires explicit source-fidelity acceptance before indexing")
++        from .serialization import load_result
++        return self.vectorize_chunks(load_result(envelope["result"]))
++
++    async def aembed(self, text: str) -> list[float]:
++        """Keep sync HTTP work off the event loop; one instance serializes inference."""
++        return await asyncio.to_thread(self.embed, text)
++
++    def health(self):
++        if self._closed:
++            return {"ready": False, "closed": True}
++        if hasattr(self.provider, "health"):
++            return self.provider.health()
++        return {"ready": None, "reason": "provider_has_no_health_probe"}
++
++    def close(self):
++        with self._lock:
++            if not self._closed and hasattr(self.provider, "close"):
++                self.provider.close()
++            self._closed = True
++
++    def __enter__(self):
++        self._check_open()
++        return self
++
++    def __exit__(self, *_):
++        self.close()
+diff --git a/bear-text-beta/src/bear_text_beta/model_profiles.py b/bear-text-beta/src/bear_text_beta/model_profiles.py
+new file mode 100644
+index 0000000..d0c3387
+--- /dev/null
++++ b/bear-text-beta/src/bear_text_beta/model_profiles.py
+@@ -0,0 +1,15 @@
++"""Explicit retrieval templates; actual revisions are pinned by prepare-model."""
++
++from .models import EmbeddingProfile
++
++
++def model_profile(name: str) -> EmbeddingProfile:
++    if name == "e5-small":
++        return EmbeddingProfile()
++    if name == "bge-m3":
++        # BGE-M3 supports 8192 tokens; 512 is our conservative operating budget.
++        # Unlike BGE v1.5, M3 does not require a query instruction.
++        return EmbeddingProfile(model_id="BAAI/bge-m3", vector_dimension=1024,
++                                max_input_tokens=512, query_prefix="", document_prefix="",
++                                similarity_prefix="")
++    raise ValueError(f"Unsupported model template: {name}")
+diff --git a/bear-text-beta/src/bear_text_beta/retrieval_metrics.py b/bear-text-beta/src/bear_text_beta/retrieval_metrics.py
+new file mode 100644
+index 0000000..3e4dcbf
+--- /dev/null
++++ b/bear-text-beta/src/bear_text_beta/retrieval_metrics.py
+@@ -0,0 +1,63 @@
++"""Offline IR metrics at the identifier level supplied by the caller.
++
++Chunk IDs must be compared with chunk qrels, document IDs with document qrels.
++Missing judgments are treated as zero relevance. No model inference is done here.
++"""
++
++import math
++from collections.abc import Mapping, Sequence
++from numbers import Real
++
++
++def _finite_number(value):
++    return isinstance(value, Real) and not isinstance(value, bool) and math.isfinite(value)
++
++
++def query_metrics(ranking: Sequence[str], qrels: Mapping[str, float], *, final_k=10, candidate_k=50):
++    if type(final_k) is not int or type(candidate_k) is not int or not 1 <= final_k <= candidate_k:
++        raise ValueError("Require 1 <= final_k <= candidate_k")
++    if not qrels or any(not _finite_number(value) or value < 0 for value in qrels.values()):
++        raise ValueError("qrels must contain finite non-negative relevance grades")
++    if len(set(ranking)) != len(ranking):
++        raise ValueError("Duplicate result IDs distort retrieval metrics")
++    positives = {identifier for identifier, grade in qrels.items() if grade > 0}
++    if not positives:
++        raise ValueError("At least one positive judgment is required")
++    gains = [(2 ** qrels.get(identifier, 0) - 1) / math.log2(rank + 2)
++             for rank, identifier in enumerate(ranking[:final_k])]
++    ideal = sorted(qrels.values(), reverse=True)[:final_k]
++    idcg = sum((2 ** grade - 1) / math.log2(rank + 2) for rank, grade in enumerate(ideal))
++    first = next((rank for rank, identifier in enumerate(ranking[:final_k], 1)
++                  if identifier in positives), None)
++    return {f"ndcg@{final_k}": sum(gains) / idcg,
++            f"mrr@{final_k}": 1 / first if first else 0.0,
++            f"recall@{candidate_k}": len(set(ranking[:candidate_k]) & positives) / len(positives)}
++
++
++def percentile(values, fraction):
++    if not values or not 0 <= fraction <= 1:
++        raise ValueError("Non-empty values and fraction in [0,1] required")
++    if any(not _finite_number(value) or value < 0 for value in values):
++        raise ValueError("Latencies must be finite non-negative milliseconds")
++    ordered = sorted(values)
++    position = (len(ordered) - 1) * fraction
++    low, high = math.floor(position), math.ceil(position)
++    return ordered[low] + (ordered[high] - ordered[low]) * (position - low)
++
++
++def evaluate_rankings(rankings, qrels, *, latencies_ms=None, final_k=10, candidate_k=50):
++    """Macro average over all judged queries; reject missing queries, never skip them."""
++    if not qrels or set(rankings) != set(qrels):
++        raise ValueError("Rankings must cover exactly the judged query IDs (use [] for no hits)")
++    per_query = {query_id: query_metrics(rankings[query_id], grades,
++                                       final_k=final_k, candidate_k=candidate_k)
++                 for query_id, grades in qrels.items()}
++    keys = next(iter(per_query.values()))
++    summary = {key: sum(row[key] for row in per_query.values()) / len(per_query) for key in keys}
++    summary["query_count"] = len(per_query)
++    if latencies_ms is not None:
++        if set(latencies_ms) != set(qrels):
++            raise ValueError("Provide one measured latency per judged query")
++        values = list(latencies_ms.values())
++        summary.update(p50_ms=percentile(values, 0.5), p95_ms=percentile(values, 0.95))
++    return {"summary": summary, "per_query": per_query}
+diff --git a/bear-text-beta/src/bear_text_beta/runtime.py b/bear-text-beta/src/bear_text_beta/runtime.py
+index 7a90f23..23bb901 100644
+--- a/bear-text-beta/src/bear_text_beta/runtime.py
++++ b/bear-text-beta/src/bear_text_beta/runtime.py
+@@ -5,6 +5,7 @@ from typing import BinaryIO
+ from uuid import uuid4
+ 
+ from .chunking import ChunkingService
++from .embedding_pipeline import EmbeddingPipeline, MemoryVectorCache
+ from .embeddings import (
+     CharacterTokenCounter,
+     HFTokenCounter,
+@@ -42,15 +43,26 @@ class Services:
+                                       object_storage=self.object_storage)
+         self.file_validator = FileValidator(self.parser.limits, set(self.parser.parsers))
+         self.manifest = SQLiteManifest(self.state_dir / "manifest.sqlite3")
+-        self.embeddings = UnavailableEmbeddingProvider() if offline or test_counter else InfinityEmbeddingProvider(
+-            os.getenv("BEAR_INFINITY_URL", "http://127.0.0.1:7997/v1"), self.profile, self.counter,
+-            server_model=os.getenv("BEAR_INFINITY_MODEL", "bear-e5-small"),
+-            api_key=os.getenv("BEAR_INFINITY_API_KEY"))
++        if offline or test_counter:
++            self.embeddings = UnavailableEmbeddingProvider()
++        else:
++            server_model = ("bear-e5-small" if self.profile.model_id == "intfloat/multilingual-e5-small"
++                            else self.profile.model_id)
++            provider = InfinityEmbeddingProvider(
++                os.getenv("BEAR_INFINITY_URL", "http://127.0.0.1:7997/v1"), self.profile, self.counter,
++                server_model=os.getenv("BEAR_INFINITY_MODEL", server_model),
++                api_key=os.getenv("BEAR_INFINITY_API_KEY"))
++            self.embeddings = EmbeddingPipeline(provider, self.counter, self.profile,
++                                                max_tokens=provider.max_tokens,
++                                                cache=MemoryVectorCache())
+         chunker_url = os.getenv("BEAR_CHUNKER_URL")
+         self.chunker = RemoteChunkingService(chunker_url) if chunker_url else ChunkingService(
+             self.counter, self.embeddings, self.profile)
+         self.vectors = QdrantVectorStore(os.getenv("BEAR_QDRANT_URL", "http://127.0.0.1:6333"),
+-                                        os.getenv("BEAR_QDRANT_COLLECTION", "bear_text_e5_small_v1"),
++                                        os.getenv("BEAR_QDRANT_COLLECTION", (
++                                            "bear_text_e5_small_v1"
++                                            if self.profile.model_id == "intfloat/multilingual-e5-small"
++                                            else "bear_text_" + self.profile.identifier())),
+                                         self.profile.vector_dimension,
+                                         api_key=os.getenv("BEAR_QDRANT_API_KEY"))
+         self.indexer = IndexingService(self.manifest, self.vectors, self.embeddings, self.counter, self.profile)
+diff --git a/bear-text-beta/tests/test_deep_architecture.py b/bear-text-beta/tests/test_deep_architecture.py
+index 1d0d62b..7a96bc1 100644
+--- a/bear-text-beta/tests/test_deep_architecture.py
++++ b/bear-text-beta/tests/test_deep_architecture.py
+@@ -114,7 +114,10 @@ def test_api_rejects_oversized_body_before_parsing():
+ 
+ 
+ def test_dedoc_tree_to_contract_preserves_table_order(tmp_path):
+-    from dedoc_service import _dedoc_to_contract
++    # The standalone Dedoc service is not distributed in this upstream repository.
++    # Run its contract test when that service package is provided by the team.
++    service = pytest.importorskip("dedoc_service", reason="External Dedoc service package is not bundled")
++    _dedoc_to_contract = service._dedoc_to_contract
+ 
+     def node(identifier, text, line_id, annotations=None, children=None, line_type="raw_text"):
+         return SimpleNamespace(node_id=identifier, text=text, annotations=annotations or [],
+diff --git a/bear-text-beta/tests/test_embedding_pipeline.py b/bear-text-beta/tests/test_embedding_pipeline.py
+new file mode 100644
+index 0000000..7a615b9
+--- /dev/null
++++ b/bear-text-beta/tests/test_embedding_pipeline.py
+@@ -0,0 +1,217 @@
++import asyncio
++import copy
++import json
++import math
++from dataclasses import asdict, replace
++
++import httpx
++import pytest
++from bear_text_beta.embedding_pipeline import EmbeddingPipeline, MemoryVectorCache
++from bear_text_beta.embeddings import InfinityEmbeddingProvider
++from bear_text_beta.errors import EmbeddingError, ValidationError
++from bear_text_beta.indexing import IndexingService, QdrantVectorStore
++from bear_text_beta.models import ProcessingProfile
++from bear_text_beta.storage import SQLiteManifest
++
++
++class Provider:
++    def __init__(self, profile):
++        self.profile = profile
++        self.calls = []
++        self.closed = False
++
++    def embed_batch(self, texts, purpose):
++        self.calls.append((list(texts), purpose))
++        return [[3.0, 4.0, 0.0, 0.0] for _ in texts]
++
++    def close(self):
++        self.closed = True
++
++
++@pytest.fixture
++def pipeline(profile, counter):
++    return EmbeddingPipeline(Provider(profile), counter, profile, cache=MemoryVectorCache(), batch_size=2)
++
++
++def test_query_normalization_trace_and_unit_vector(pipeline):
++    trace = pipeline.vectorize_query("  Как\n настроить  SSL в NGINX? \u0438\u0306  ")
++    assert trace.query.original.startswith("  Как")
++    assert trace.query.text == "Как настроить SSL в NGINX? й"
++    assert trace.query.builder_version == "nfc-whitespace-v1"
++    assert trace.vector == [0.6, 0.8, 0.0, 0.0]
++    assert trace.elapsed_ms >= 0
++    assert trace.embedding_profile_id == pipeline.profile.identifier()
++
++
++def test_custom_transform_once_per_entry_point(profile, counter):
++    calls = []
++    def expand(text):
++        calls.append(text)
++        return text + " TLS"
++    pipeline = EmbeddingPipeline(Provider(profile), counter, profile,
++                                 query_transform=expand, builder_version="tls-expansion-v1")
++    pipeline.vectorize_query("SSL")
++    pipeline.embed_batch(["SSL"], "query")
++    assert calls == ["SSL", "SSL"]
++    assert pipeline.provider.calls == [(["SSL TLS"], "query"), (["SSL TLS"], "query")]
++
++
++def test_transform_requires_version(profile, counter):
++    with pytest.raises(ValidationError, match="builder_version"):
++        EmbeddingPipeline(Provider(profile), counter, profile, query_transform=lambda text: text)
++
++
++@pytest.mark.parametrize("text", ["", " \n\t", None, 123, "x" * 1000])
++def test_invalid_query_fails_before_inference(pipeline, text):
++    with pytest.raises(ValidationError):
++        pipeline.embed(text)
++    assert pipeline.provider.calls == []
++
++
++def test_cache_batch_deduplication_order_and_ownership(pipeline):
++    texts = ["a", "b", "a", "c", "d", "e"]
++    first = pipeline.embed_batch(texts, "document")
++    assert [len(batch) for batch, _ in pipeline.provider.calls] == [2, 2, 1]
++    first[0][0] = 999
++    second = pipeline.embed_batch(texts, "document")
++    assert len(pipeline.provider.calls) == 3
++    assert second == [[0.6, 0.8, 0.0, 0.0]] * 6
++    assert first[2][0] == 0.6
++
++
++def test_cache_separates_purpose_and_model_revision(pipeline, profile, counter):
++    pipeline.embed_batch(["SSL"], "document")
++    pipeline.embed("SSL")
++    assert len(pipeline.provider.calls) == 2
++    changed = replace(profile, model_revision="other-fixed")
++    other_counter = copy.copy(counter)
++    other_counter.profile = changed
++    other = EmbeddingPipeline(Provider(changed), other_counter, changed, cache=pipeline.cache)
++    other.embed("SSL")
++    assert len(other.provider.calls) == 1
++
++
++def test_cache_is_bounded():
++    cache = MemoryVectorCache(1)
++    cache.put("a", [1])
++    cache.put("b", [2])
++    assert cache.get("a") is None
++    assert cache.get("b") == [2]
++
++
++@pytest.mark.parametrize("vector", [[0.0] * 4, [math.nan] * 4, [True] * 4, [1.0]])
++def test_invalid_provider_vectors_rejected(pipeline, vector):
++    pipeline.provider.embed_batch = lambda texts, purpose: [vector for _ in texts]
++    with pytest.raises(EmbeddingError):
++        pipeline.embed("SSL")
++
++
++def test_all_lengths_checked_before_any_document_inference(pipeline):
++    with pytest.raises(ValidationError):
++        pipeline.embed_batch(["short", "x" * 1000], "document")
++    assert pipeline.provider.calls == []
++
++
++def test_profile_agreement_and_revisions(profile, counter):
++    with pytest.raises(ValidationError, match="profiles differ"):
++        EmbeddingPipeline(Provider(replace(profile, model_id="other")), counter, profile)
++    with pytest.raises(ValidationError, match="Pin"):
++        EmbeddingPipeline(Provider(profile), counter, replace(profile, model_revision=""))
++
++
++def test_real_chunker_input_preserves_ids_source_and_metadata(pipeline, parsed, chunker):
++    result = chunker.process(parsed("Раздел\n\nТекст о настройке SSL."), ProcessingProfile(mode="token"))
++    original = copy.deepcopy(asdict(result))
++    embedded = pipeline.vectorize_chunks(result)
++    assert asdict(result) == original
++    assert [entry.chunk for entry in embedded] == result.chunks
++    assert all(entry.vector == [0.6, 0.8, 0.0, 0.0] for entry in embedded)
++    assert pipeline.provider.calls[0] == ([chunk.embedding_text for chunk in result.chunks], "document")
++    result.metrics["embedding_profile_id"] = "wrong"
++    with pytest.raises(ValidationError):
++        pipeline.vectorize_chunks(result)
++
++
++def test_document_text_layout_is_not_query_normalized(pipeline):
++    text = "# Заголовок\n    def code():\n        return 1\n"
++    pipeline.embed_batch([text], "document")
++    assert pipeline.provider.calls == [([text], "document")]
++
++
++def test_fusion_experimental_envelope_is_not_silently_accepted(pipeline, parsed, chunker):
++    result = chunker.process(parsed("Текст."))
++    envelope = {"accepted_for_indexing": False, "source_fidelity": "unverified", "result": asdict(result)}
++    with pytest.raises(ValidationError, match="acceptance"):
++        pipeline.vectorize_envelope(envelope)
++    assert pipeline.provider.calls == []
++
++
++def test_metrics_events_and_optional_text_logging(profile, counter, caplog):
++    events = []
++    pipeline = EmbeddingPipeline(Provider(profile), counter, profile, on_event=events.append,
++                                 cache=MemoryVectorCache())
++    pipeline.embed("secret query")
++    pipeline.embed(" secret query ")
++    assert [(event.cache_hits, event.inferred_count) for event in events] == [(0, 1), (1, 0)]
++    assert "secret query" not in caplog.text
++    with caplog.at_level("INFO"):
++        pipeline.log_query_text = True
++        pipeline.embed("  SSL  ")
++    assert caplog.records[-1].original_query == "  SSL  "
++    assert caplog.records[-1].prepared_query == "SSL"
++
++
++def test_async_and_close(pipeline):
++    assert asyncio.run(pipeline.aembed("SSL")) == [0.6, 0.8, 0.0, 0.0]
++    pipeline.close()
++    pipeline.close()
++    assert pipeline.provider.closed
++    assert pipeline.health()["ready"] is False
++    with pytest.raises(EmbeddingError, match="closed"):
++        pipeline.embed("SSL")
++
++
++def test_actual_infinity_and_qdrant_adapters_with_pipeline(parsed, chunker, profile, counter, tmp_path):
++    """Real adapters, real parsing/chunking/manifest; HTTP service responses are mocked."""
++    infinity_requests, qdrant_requests, points = [], [], {}
++    def inference(request):
++        body = json.loads(request.content)
++        infinity_requests.append(body)
++        return httpx.Response(200, json={"data": [
++            {"index": i, "embedding": [3.0, 4.0, 0.0, 0.0]}
++            for i in reversed(range(len(body["input"])))
++        ]})
++    def qdrant(request):
++        body = json.loads(request.content) if request.content else {}
++        qdrant_requests.append(body)
++        if request.url.path.endswith("/points/query"):
++            found = [dict(point, score=0.9) for point in points.values() if all(
++                (point["payload"].get(c["key"]) == c["match"]["value"] if "value" in c["match"]
++                 else point["payload"].get(c["key"]) in c["match"]["any"])
++                for c in body["filter"]["must"])]
++            return httpx.Response(200, json={"result": {"points": found[:body["limit"]]}})
++        if request.url.path.endswith("/points"):
++            if request.method == "PUT":
++                points.update({point["id"]: point for point in body["points"]})
++                return httpx.Response(200, json={"result": {"status": "completed"}})
++            return httpx.Response(200, json={"result": [points[key] for key in body["ids"] if key in points]})
++        return httpx.Response(200, json={"result": {"config": {"params": {
++            "vectors": {"size": 4, "distance": "Cosine"}}}}})
++    provider = InfinityEmbeddingProvider("", profile, counter, client=httpx.Client(
++        base_url="http://infinity/v1/", transport=httpx.MockTransport(inference)))
++    pipeline = EmbeddingPipeline(provider, counter, profile, max_tokens=provider.max_tokens)
++    store = QdrantVectorStore("", "test", 4, client=httpx.Client(
++        base_url="http://qdrant/", transport=httpx.MockTransport(qdrant)))
++    indexer = IndexingService(SQLiteManifest(tmp_path / "state.db"), store, pipeline, counter, profile)
++    result = chunker.process(parsed("Текст про SSL."), ProcessingProfile(mode="token"))
++    assert indexer.index(result)["status"] == "indexed"
++    hits = indexer.search("  Как\n настроить SSL? ", "tenant-a", "space-a", top_k=50)
++    assert hits[0].id == result.chunks[0].id
++    assert hits[0].payload["source_spans"] == asdict(result.chunks[0])["source_spans"]
++    assert infinity_requests[-1]["input"] == ["query: Как настроить SSL?"]
++    assert infinity_requests[0]["input"][0] == "passage: " + result.chunks[0].embedding_text
++    assert qdrant_requests[-1]["query"] == [0.6, 0.8, 0.0, 0.0]
++    assert indexer.search("SSL", "different-tenant", "space-a") == []
++    assert indexer.search("SSL", "tenant-a", "different-space") == []
++    pipeline.close()
++    store.close()
+diff --git a/bear-text-beta/tests/test_model_profiles.py b/bear-text-beta/tests/test_model_profiles.py
+new file mode 100644
+index 0000000..f357e50
+--- /dev/null
++++ b/bear-text-beta/tests/test_model_profiles.py
+@@ -0,0 +1,53 @@
++from dataclasses import replace
++from pathlib import Path
++from types import SimpleNamespace
++
++import httpx
++import pytest
++from bear_text_beta.bootstrap import prepare_model
++from bear_text_beta.embedding_pipeline import EmbeddingPipeline
++from bear_text_beta.embeddings import InfinityEmbeddingProvider, load_profile
++from bear_text_beta.errors import ValidationError
++from bear_text_beta.model_profiles import model_profile
++
++
++def test_bge_m3_profile_has_no_e5_or_bge_v15_prefixes(counter):
++    import json
++    profile = replace(model_profile("bge-m3"), model_revision="fixed", tokenizer_revision="fixed")
++    counter = type(counter)(profile)
++    calls = []
++    def handle(request):
++        body = json.loads(request.content)
++        calls.append(body)
++        return httpx.Response(200, json={"data": [
++            {"index": i, "embedding": [1.0] + [0.0] * 1023} for i, _ in enumerate(body["input"])]})
++    provider = InfinityEmbeddingProvider("", profile, counter, client=httpx.Client(
++        base_url="http://infinity/v1/", transport=httpx.MockTransport(handle)))
++    pipeline = EmbeddingPipeline(provider, counter, profile, max_tokens=480)
++    pipeline.embed_batch(["Документ"], "document")
++    assert len(pipeline.embed(" Вопрос ")) == 1024
++    assert [body["input"] for body in calls] == [["Документ"], ["Вопрос"]]
++
++
++def test_prepare_bge_pins_revisions_and_rejects_wrong_directory(tmp_path, monkeypatch):
++    import huggingface_hub
++    revision = "b" * 40
++    calls = []
++    monkeypatch.setattr(huggingface_hub, "HfApi", lambda: SimpleNamespace(
++        model_info=lambda model, token=False: SimpleNamespace(sha=revision)))
++    def download(model, revision, local_dir, **kwargs):
++        calls.append((model, revision))
++        root = Path(local_dir)
++        root.mkdir(parents=True, exist_ok=True)
++        (root / "tokenizer.json").write_text("{}", encoding="utf-8")
++    monkeypatch.setattr(huggingface_hub, "snapshot_download", download)
++    model_dir = tmp_path / "model"
++    prepare_model(model_dir, model="bge-m3")
++    prepared = load_profile(model_dir)
++    assert prepared.model_id == "BAAI/bge-m3"
++    assert prepared.vector_dimension == 1024 and prepared.query_prefix == ""
++    assert prepared.model_revision == prepared.tokenizer_revision == revision
++    prepare_model(model_dir, model="bge-m3")
++    assert len(calls) == 1
++    with pytest.raises(ValidationError, match="another model"):
++        prepare_model(model_dir, model="e5-small")
+diff --git a/bear-text-beta/tests/test_retrieval_metrics.py b/bear-text-beta/tests/test_retrieval_metrics.py
+new file mode 100644
+index 0000000..e7c444f
+--- /dev/null
++++ b/bear-text-beta/tests/test_retrieval_metrics.py
+@@ -0,0 +1,40 @@
++import pytest
++from bear_text_beta.retrieval_metrics import evaluate_rankings, percentile, query_metrics
++
++
++def test_one_relevant_at_third_position():
++    metrics = query_metrics(["wrong", "also-wrong", "right"], {"right": 1})
++    assert metrics == {"ndcg@10": 0.5, "mrr@10": 1 / 3, "recall@50": 1}
++
++
++def test_reranking_cannot_change_candidate_recall():
++    original = [str(i) for i in range(50)]
++    reranked = list(reversed(original))
++    qrels = {"49": 2, "48": 1, "missing": 1}
++    before, after = query_metrics(original, qrels), query_metrics(reranked, qrels)
++    assert before["recall@50"] == after["recall@50"] == 2 / 3
++    assert before["mrr@10"] == before["ndcg@10"] == 0
++    assert after["mrr@10"] == 1 and after["ndcg@10"] > 0
++
++
++def test_macro_average_includes_no_hits_and_latency():
++    report = evaluate_rankings({"q1": ["a"], "q2": []}, {"q1": {"a": 1}, "q2": {"b": 1}},
++                               latencies_ms={"q1": 10, "q2": 30})
++    assert report["summary"] == {"ndcg@10": 0.5, "mrr@10": 0.5, "recall@50": 0.5,
++                                  "query_count": 2, "p50_ms": 20, "p95_ms": 29}
++
++
++@pytest.mark.parametrize("ranking,qrels", [(["a", "a"], {"a": 1}), ([], {}), ([], {"a": 0}),
++                                            ([], {"a": -1}), ([], {"a": float("nan")})])
++def test_bad_qrels_and_duplicate_ids_rejected(ranking, qrels):
++    with pytest.raises(ValueError):
++        query_metrics(ranking, qrels)
++
++
++def test_missing_query_not_silently_dropped():
++    with pytest.raises(ValueError):
++        evaluate_rankings({}, {"q": {"a": 1}})
++    with pytest.raises(ValueError):
++        evaluate_rankings({"q": []}, {"q": {"a": 1}}, latencies_ms={})
++    with pytest.raises(ValueError):
++        percentile([float("inf")], 0.5)
+diff --git a/docs/embedding/architecture.md b/docs/embedding/architecture.md
+new file mode 100644
+index 0000000..2585e3d
+--- /dev/null
++++ b/docs/embedding/architecture.md
+@@ -0,0 +1,64 @@
++# Архитектура и границы интеграции
++
++Основание: предоставленная «Презентация 29.10.pdf», страницы 6, 16, 19-21;
++код upstream commit `c2447d4ff89cb0f5e33006d505e6d0243930c292`.
++
++Страницы 19-21 разделяют ingestion и search. Поэтому буквальная линейная цепочка
++«документ -> сбор поискового вопроса -> embedding» была бы ошибочной интерпретацией задания.
++Общий класс обслуживает два пути, использующих одну модель.
++
++```mermaid
++flowchart TD
++  A[Парсер и чанкер] --> B[ProcessingResult и embedding_text]
++  B --> E[EmbeddingPipeline]
++  Q[Вопрос пользователя] --> N[Сбор запроса]
++  N --> E
++  E --> I[EmbeddingProvider: Infinity]
++  I --> V[Проверенные dense-векторы]
++  V --> S[IndexingService и Qdrant]
++  S --> M[Ранжированные ID и метрики]
++```
++
++## Соответствие контрактов
++
++| Граница | Фактический контракт | Решение |
++|---|---|---|
++| Предыдущий блок | `ProcessingResult`, `Chunk` из `bear_text_beta.models` | Используются напрямую, без второй несовместимой схемы |
++| Текст документа | `chunk.embedding_text` | Используется verbatim; `chunk.text` остаётся исходным |
++| Контекст | `section_path`, `source_spans`, `attachment_ids`, metadata | Не удаляется и не пересобирается |
++| Inference | `embed_batch(texts, purpose)` | Реализован в классе; HTTP остаётся внутри InfinityEmbeddingProvider |
++| Презентация | `embed(text)`, `embed_batch(texts)` | Есть оба метода; purpose по умолчанию document |
++| Выход ingestion | `EmbeddedChunk(chunk, vector, embedding_profile_id)` | Можно передать существующему `VectorStore.upsert(chunks, result)` |
++| Поиск | `IndexingService.search(query, tenant_id, space_id, top_k)` | Использует тот же pipeline через dependency injection |
++| Qdrant | Cosine, dimension, tenant/space/generation/profile filters | Контракт сохранён; класс не активирует поколения самостоятельно |
++| Метрики | ранжированные ID, qrels, измеренное время | Отдельные функции, не зависящие от БД или эмбеддера |
++
++`vectorize_chunks()` подготавливает DTO; для настоящей индексации использовать
++`IndexingService.index(result)`, сохраняющий ChunkValidator, manifest, retry, проверку записи
++и переключение активного поколения. Простое `store.upsert()` этих гарантий не даёт.
++
++Формат FusionPipeline содержит `accepted_for_indexing=false` и `source_fidelity=unverified`.
++`vectorize_envelope()` отклоняет такой результат. Передача возможна только после внешней проверки
++качества источников и явного статуса `accepted_for_indexing=true`, `source_fidelity=verified`.
++Код не меняет эти поля и не считает существующий эксперимент production-ready.
++
++## Профиль и длина
++
++`EmbeddingProfile.identifier()` уже включает модель, ревизии, размерность, токенный предел и
++раздельные префиксы. Этот ID связывает checkpoint, кэш, Qdrant payload и поисковый фильтр.
++Все входы проверяются **с префиксом и специальными токенами**, используя HFTokenCounter.
++Длинный текст возвращает ошибку: исправление чанкинга/запроса должно быть видимым действием.
++
++BGE-M3 получает одинаковое пространство без инструкций. E5 получает асимметричные префиксы.
++Смысл требования - совместимость одного профиля, а не побайтово одинаковая подготовка обеих сторон.
++Смена политики документов, модели, префиксов или tokenizer revision требует новых checkpoint
++и переиндексации. Эксперименты со сборкой запросов могут использовать прежний корпус при том же
++документном профиле, но должны фиксировать builder_version в отчёте.
++
++## Ответственность за доступ
++
++Проверка разрешений пользователя остаётся в AuthorizationService перед вызовом SearchService,
++как на странице 21. Tenant/space-фильтры адаптера не заменяют авторизацию.
++SQLiteManifest и local object storage здесь унаследованы от beta-стенда, а не выданы за готовую
++реализацию PostgreSQL/Redis Streams/S3. Их production-адаптеры остаются границами основной команды.
++Реализован dense-путь; sparse/hybrid и реранкер - отдельные следующие блоки.
+diff --git a/docs/embedding/deepseek_review.md b/docs/embedding/deepseek_review.md
+new file mode 100644
+index 0000000..51bdaf7
+--- /dev/null
++++ b/docs/embedding/deepseek_review.md
+@@ -0,0 +1,43 @@
++# Разбор предоставленных скриншотов DeepSeek
++
++Скриншоты прочитаны как рекомендации, а не как спецификация API. Ниже указано,
++какие решения приняты в коде и где обобщения требуют исправления.
++
++| Рекомендация | Оценка и принятое решение |
++|---|---|
++| Линейная схема ingestion -> query building -> embedding | Для BEAR это две ветви: документы и вопросы. Вопрос не строится из каждого документа. Соответствует страницам 20-21 презентации. |
++| Одна модель для документов и вопросов | Принято. Проверяется профиль провайдера/токенизатора и сохраняется embedding_profile_id. Размерность сама по себе совместимость не доказывает. |
++| Одинаковая препроцессинг-логика и префиксы | Уточнено: правила должны соответствовать модели. E5 требует `query:` для вопросов и `passage:` для документов; BGE-M3 не требует query instruction. Асимметрия сама по себе не ошибка. |
++| Универсальный BGE-префикс Represent this sentence… | Не перенесён на BGE-M3. Карточка BGE-M3 явно говорит об отсутствии обязательной инструкции. |
++| NFC, пробелы, осторожность с lowercase/stemming | Принято для запроса. Не удаляем регистр, отрицания, слова «найди» и технические обозначения. Документный embedding_text не изменяем, чтобы сохранить код, таблицы и связь с источником. |
++| Добавлять заголовки/section в чанк | В upstream уже реализован ChunkContextBuilder. Используем готовый embedding_text без повторного обогащения. |
++| Chunk ID, doc ID, source, section, порядок | Сохраняем существующие Chunk/ProcessingResult, а не создаём конфликтующую схему. Tenant/space/version/generation добавляет прежний Qdrant-адаптер. |
++| Overlap обязателен, диапазон 200-600 оптимален | Это гипотезы для эксперимента, не универсальные требования. Структурные строки таблиц и parent-child могут требовать иных правил. Новая часть не меняет чанкинг без измерения качества. |
++| 512 токенов как предел каждого запроса | Число зависит от профиля. Считаем токены с префиксом и special tokens, превышение отклоняем. У BGE-M3 физический максимум 8192; рабочий профиль ограничен сильнее. |
++| Один язык корпуса и запроса | Не обязательное условие для мультиязычных моделей. Автоматический перевод не включён; его нужно сравнивать отдельно и сохранять исходный запрос. |
++| Нормировать векторы | Принято: явная L2-нормализация, проверка размерности/NaN/Inf/zero. Qdrant Cosine тоже нормализует; явная норма упрощает ручной dot-product и тестирование. |
++| Кэш sha256(text) | Недостаточный ключ. Добавлены профиль с ревизиями, назначение, рабочий лимит, версия реализации и подготовленный текст. Кэш ограниченный, opt-in, в памяти; Redis можно подключить по VectorCache. |
++| Батч 32-64 на 16GB, fp16 вдвое быстрее | Не гарантия. Память и скорость зависят от длины/батча/сервера. По умолчанию 16; dtype и загрузка весов принадлежат Infinity. Новые цифры VRAM/скорости не выдумываются. |
++| Держать модель загруженной | Реализуется внешним Infinity. Класс переиспользует HTTP-клиент и провайдер, а не загружает модель на запрос. |
++| Асинхронность и vLLM | Есть aembed через asyncio.to_thread для sync-контракта. Для high-load нужен самостоятельный async-провайдер/пул; текущий класс сериализует вызовы. Infinity остаётся согласованным сервером проекта. |
++| HyDE / rewriting / expansion / multi-query / история | По умолчанию выключены. Один query_transform разрешён с обязательной builder_version. Полная история не склеивается. Multi-query требует отдельного слияния результатов (например RRF), его нельзя заменить средним вектором без проверки. |
++| Логировать исходный и обработанный вопрос | PreparedQuery возвращает оба значения. Вывод содержимого в общий лог opt-in; метрики стадий обходятся без текста. |
++| Для чанкинга nDCG, для query building MRR | Все три качественные метрики полезны в каждом эксперименте. Фиксируем остальные слои, а не выбираем одну метрику исключительно по названию слоя. |
++
++## Как валидировать изменения
++
++1. Заморозить корпус, qrels, модель/ревизию, поиск и реранкер; менять только сборку запроса.
++2. Сохранить original, normalized, final text, builder_version, профиль и ранжированные ID.
++3. Посчитать nDCG@10, MRR@10, Recall@50; отдельно измерить время всего запроса.
++4. Для смены чанкинга сначала перенести qrels на новые ID или оценивать стабильные document-ID.
++5. Не объявлять рост на 200 вопросах статистически значимым без соответствующей проверки.
++
++Общие исправления подтверждены первичными источниками (проверены 05.11.2026):
++
++- [BAAI/bge-m3, модельная карточка: FAQ и Specs](https://huggingface.co/BAAI/bge-m3)
++- [intfloat/multilingual-e5-small, модельная карточка](https://huggingface.co/intfloat/multilingual-e5-small)
++- [Infinity, официальный клиент/API](https://github.com/michaelfeil/infinity/blob/main/docs/docs/client_infinity.md)
++- [Qdrant, коллекции и Cosine](https://qdrant.tech/documentation/manage-data/collections/)
++
++Сравнение моделей из скриншотов не заменяет наш RuBQ-бенчмарк. Новых выводов о лидерстве
++Qwen 4B/8B или требуемой VRAM из этих рекомендаций не делаем.
+diff --git a/docs/embedding/merge_plan.md b/docs/embedding/merge_plan.md
+new file mode 100644
+index 0000000..77596ba
+--- /dev/null
++++ b/docs/embedding/merge_plan.md
+@@ -0,0 +1,85 @@
++# Подготовка merge и перенос
++
++## Что уже подготовлено
++
++- База: `IRelapseIT/BEAR_Chanking-Parsing` commit `c2447d4ff89cb0f5e33006d505e6d0243930c292`.
++- Ветка реализации: `feature/embedding-pipeline` поверх этой базы.
++- Сохранены оба пакета `bear-text-beta` и `bear-fusion-lab`; нет переименования исходных сущностей.
++- Добавлены класс, шаблон BGE-M3, метрики, демо, тесты, документация и CI для GitHub/GitLab.
++- `Services` использует новый класс для онлайн-инференса; offline/test режимы сохранены.
++- Внешний `dedoc_service`, отсутствующий в upstream, явно обозначен как необязательная зависимость
++  одного его теста. Реализация Dedoc не подменялась заглушкой в production-коде.
++- Тест RSS experimental demo пропускается, если psutil не видит процессы в среде;
++  в обычной ОС проверка по-прежнему выполняется. Production-логика лимитов не менялась.
++
++Название/URL «текущего» репозитория не были предоставлены. Поэтому пакет готов к проверке
++и переносу, но слияние с неизвестной целевой историей и разрешение её конфликтов не заявляются.
++В подключённом GitHub у `IRelapseIT/BEAR_Chanking-Parsing` есть только read-доступ;
++доступный для записи `Golang` к BEAR не относится и не изменялся.
++
++## Существующий BEAR на GitHub или GitLab
++
++В архиве есть исходники, patch и `transfer/BEAR_Embedding.bundle` с историей базы и feature-веткой.
++Сначала распаковать ZIP. Из существующего локального checkout целевого BEAR:
++
++```bash
++git fetch /absolute/path/to/transfer/BEAR_Embedding.bundle feature/embedding-pipeline
++git switch -c feature/embedding-pipeline-import FETCH_HEAD
++python -m pip install -e './bear-text-beta[dev]'
++python -m pytest bear-text-beta/tests -q
++```
++
++Если целевой проект имеет общую историю с upstream, можно открыть PR/MR из импортированной
++ветки в целевую main. Прямой push в защищённую main не требуется.
++
++Если корни истории разные, не применять `--allow-unrelated-histories` вслепую.
++Создать ветку **от целевой main**, затем перенести оба пакета и документацию в согласованные
++каталоги (`git restore --source=...` по выбранным путям или ручной перенос).
++Сверить основную командную схему `Chunk`/`ProcessingResult` и порты; при отличиях писать адаптер,
++а не держать два параллельных несовместимых класса. После этого повторить тесты и создать MR.
++Схема основного GitLab из презентации не была доступна для чтения в этой задаче.
++
++## Новый пустой репозиторий
++
++Владелец создаёт пустой `BEAR-Embedding` без README/License/.gitignore (или предоставляет
++существующий пустой репозиторий с доступом). Полную историю из bundle можно развернуть так:
++
++```bash
++git clone transfer/BEAR_Embedding.bundle BEAR-Embedding
++cd BEAR-Embedding
++git remote rename origin transfer
++git branch main transfer/main
++git remote add origin https://github.com/OWNER/BEAR-Embedding.git
++git push origin main
++git push -u origin feature/embedding-pipeline
++```
++
++`OWNER` заменить своим логином; URL GitLab задаётся аналогично. Это обычный push, без force.
++В `main` находится исходная база, реализация - в feature-ветке. Затем открыть PR/MR
++`feature/embedding-pipeline -> main`. Обе ветки входят в bundle. Рекомендованное название MR:
++`Добавить EmbeddingPipeline между чанкингом и Qdrant`.
++
++Описание MR:
++
++> Добавляет сборку поисковых запросов и пакетную векторизацию готовых чанков через Infinity.
++> Сохраняет существующие ProcessingResult/Chunk, метаданные, профили и фильтры Qdrant.
++> Включает проверку токенного бюджета, нормализацию, опциональный кэш, IR-метрики и тесты контрактов.
++> Реальные модели и сервисы проверяются отдельным smoke-test; новый RuBQ-бенчмарк не выполнялся.
++
++## Важное различие форматов GitLab
++
++Обычный ZIP исходников не является GitLab Project Export. Нельзя обещать его прямой импорт
++через кнопку импорта проекта. Рабочие варианты: распаковать ZIP и сделать git push из bundle,
++либо после публикации использовать **Repository by URL** при включённой этой возможности.
++GitLab Project Export - отдельный архив, формируемый самим GitLab, с метаданными проекта;
++этот пакет им не является. Здесь сохранена Git-история, но не issues/MR/настройки доступа.
++
++Первичные инструкции: [GitLab Project Export](https://docs.gitlab.com/user/project/settings/import_export/)
++и [Repository by URL](https://docs.gitlab.com/user/import/third_party_systems/repo_by_url/).
++
++## До командного merge
++
++Сверить фактическую схему основного GitLab и способ DI, запустить Infinity/Qdrant smoke,
++проверить ту же ревизию весов и токенизатора, затем прогнать RuBQ с неизменными qrels.
++Статусы экспериментального Fusion не переводить в accepted без проверки source fidelity.
++Публикация и фактический MR требуют конкретного целевого URL и write-доступа.
+diff --git a/docs/embedding/validation.md b/docs/embedding/validation.md
+new file mode 100644
+index 0000000..cc442e0
+--- /dev/null
++++ b/docs/embedding/validation.md
+@@ -0,0 +1,60 @@
++# Проверка реализации, 05.11.2026
++
++Среда: Python 3.12.14, отдельное venv. Тяжёлые веса не скачивались.
++Для upstream-тестов подготовлен настоящий токенизатор E5 с ревизией
++`614241f622f53c4eeff9890bdc4f31cfecc418b3`; BGE-инференс проверен по HTTP-контракту,
++не запуском настоящей модели.
++
++| Проверка | Результат |
++|---|---|
++| Все core-тесты `bear-text-beta/tests` | 106 passed, 1 skipped |
++| Все Fusion-тесты `bear-fusion-lab/tests` | 51 passed, 1 skipped |
++| Новые тесты pipeline/model profiles/IR metrics (входят в 106) | 34 passed |
++| Ruff 0.12.12, новые Python-файлы и примеры | Passed |
++| Offline demo | Успешно: TXT -> настоящий чанкер -> mock Infinity -> DTO, 4D unit vector, cache hit |
++| Настоящий Infinity с весами и сервер Qdrant | Не запускались; подготовлен `examples/smoke_external.py` |
++| Новый прогон RuBQ | Не выполнялся; прежние оценки не выдаются за результат нового класса |
++
++Пропуски:
++
++1. Upstream-тест `test_dedoc_tree_to_contract_preserves_table_order` импортирует
++   `dedoc_service`, отсутствующий в репозитории. Он выполняется при наличии внешнего пакета;
++   без него теперь использует явный `pytest.importorskip`. До этой правки общий прогон падал
++   именно на ModuleNotFoundError. Функциональность внешнего Dedoc этим не подтверждается.
++2. `test_actual_worker_stopped_on_memory_budget`: в текущей среде `psutil.Process()` возвращает
++   NoSuchProcess для собственного PID. Тест не может измерить реальный RSS и условно пропущен;
++   в обычном хостовом окружении он остаётся активен. Лимитирование ресурсов demo не проверено.
++
++В core-прогоне присутствует одно предупреждение совместимости Starlette TestClient/httpx.
++HTTP-контрактные тесты проходят; миграция upstream на иной тестовый клиент в эту задачу не входит.
++
++## Что именно проверяют новые тесты
++
++- NFC/пробелы без потери регистра и технических обозначений; raw и processed query.
++- Однократное применение query_transform и обязательная версия трансформации.
++- Пустой/нестроковый/слишком длинный запрос отклоняется до inference.
++- Сохранение точного документного embedding_text, ID, source spans и всех метаданных.
++- Пакетная обработка, порядок результатов, deduplication, ограничение размера кэша.
++- Разделение кэша по purpose и revision, защита от изменения возвращённого списка.
++- Проверка размерности/NaN/Inf/zero/boolean; L2-нормализация.
++- Согласование provider/tokenizer/profile; запрет незакреплённых ревизий.
++- BGE-M3 1024D без префиксов E5/BGE v1.5; подготовка manifest и конфликт каталога модели.
++- Реальные TXTParser, ChunkingService, SQLiteManifest, IndexingService,
++  InfinityEmbeddingProvider и QdrantVectorStore в одной проверке с mock HTTP-сервисами.
++- Префиксы добавляются один раз, Qdrant получает unit vector и исходный payload;
++  фильтры tenant/space сохраняются.
++- Экспериментальный Fusion-envelope не получает автоматическое разрешение на индексацию.
++- Async-вызов, закрытие провайдера и повторный close.
++- nDCG/MRR/Recall по известным примерам, macro average, отсутствие результатов,
++  неизменность Recall@50 при перестановке кандидатов, медиана/p95, некорректные qrels/ID.
++
++## Пределы результата
++
++Это проверка реализации и совместимости с конкретным upstream snapshot.
++Основной репозиторий GitLab из презентации не был предоставлен для чтения, его реальные
++интерфейсы и история не проверены. Не заявляются финальный командный merge, remote CI,
++боевой деплой, реальные VRAM/latency или улучшение поиска.
++
++Архив содержит Git bundle и patch для воспроизводимого переноса.
++Запуски pytest сохранены в `transfer/validation/` архива. Bundle восстанавливается локально,
++его feature-дерево сравнивается с исходниками, patch применяется к исходной базе без конфликтов.
+diff --git a/examples/embedding_pipeline_demo.py b/examples/embedding_pipeline_demo.py
+new file mode 100644
+index 0000000..a5913f0
+--- /dev/null
++++ b/examples/embedding_pipeline_demo.py
+@@ -0,0 +1,69 @@
++"""Offline wiring demo: real TXT parsing/chunking and clearly mocked HTTP inference.
++
++Run from the repository root after editable installation. No model quality claims.
++"""
++
++import json
++from dataclasses import asdict
++from pathlib import Path
++
++import httpx
++from bear_text_beta.chunking import ChunkingService
++from bear_text_beta.embedding_pipeline import EmbeddingPipeline, MemoryVectorCache
++from bear_text_beta.embeddings import InfinityEmbeddingProvider
++from bear_text_beta.models import DocumentContext, EmbeddingProfile, ProcessingProfile
++from bear_text_beta.parsing import TXTParser
++from chonkie.tokenizer import CharacterTokenizer
++
++
++class DemoCounter:
++    """Test-only character counter, never use with actual inference or Qdrant."""
++
++    def __init__(self, profile):
++        self.profile = profile
++        self.tokenizer = CharacterTokenizer()
++
++    def count(self, text):
++        return len(text)
++
++    def full_count(self, text, purpose="document"):
++        return len(self.profile.prefix(purpose) + text) + 2
++
++
++def main():
++    profile = EmbeddingProfile(model_id="MOCK-NOT-A-REAL-MODEL", model_revision="demo",
++                               tokenizer_revision="demo", vector_dimension=4)
++    counter = DemoCounter(profile)
++    requests = []
++
++    def mock_infinity(request):
++        payload = json.loads(request.content)
++        requests.append(payload)
++        return httpx.Response(200, json={"data": [
++            {"index": index, "embedding": [3, 4, 0, 0]}
++            for index in reversed(range(len(payload["input"])))
++        ]})
++
++    client = httpx.Client(base_url="http://mock-infinity/v1/", transport=httpx.MockTransport(mock_infinity))
++    provider = InfinityEmbeddingProvider("", profile, counter, client=client)
++    events = []
++    with EmbeddingPipeline(provider, counter, profile, max_tokens=480,
++                           cache=MemoryVectorCache(), on_event=events.append) as pipeline:
++        context = DocumentContext("demo-tenant", "demo-space", "ssl-guide", 1, "ssl.txt")
++        text = Path(__file__).with_name("ssl.txt").read_bytes()
++        document = TXTParser().parse(text, context)
++        result = ChunkingService(counter, pipeline, profile).process(document, ProcessingProfile(mode="token"))
++        embedded = pipeline.vectorize_chunks(result)
++        query = pipeline.vectorize_query("  Как\n настроить SSL?  ")
++        pipeline.embed("Как настроить SSL?")  # Same prepared text; cache hit.
++        print(json.dumps({
++            "mode": "MOCK: contract demo, not retrieval quality",
++            "chunks": len(embedded), "dimension": len(query.vector),
++            "original_query": query.query.original, "prepared_query": query.query.text,
++            "sample_embedded_chunk": asdict(embedded[0]),
++            "events": [asdict(event) for event in events], "http_requests": len(requests),
++        }, ensure_ascii=False, indent=2, allow_nan=False))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/examples/smoke_external.py b/examples/smoke_external.py
+new file mode 100644
+index 0000000..fb0632e
+--- /dev/null
++++ b/examples/smoke_external.py
+@@ -0,0 +1,59 @@
++"""Opt-in real service smoke test; creates and removes its own Qdrant collection."""
++
++import argparse
++import json
++import os
++import tempfile
++import time
++from pathlib import Path
++from uuid import uuid4
++
++from bear_text_beta.models import DocumentContext, ProcessingProfile
++from bear_text_beta.parsing import TXTParser
++from bear_text_beta.runtime import Services
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--model-dir", type=Path, required=True)
++    args = parser.parse_args()
++    collection = "bear_embedding_smoke_" + uuid4().hex
++    old_collection = os.environ.get("BEAR_QDRANT_COLLECTION")
++    os.environ["BEAR_QDRANT_COLLECTION"] = collection
++    runtime = None
++    try:
++        with tempfile.TemporaryDirectory(prefix="bear-embedding-smoke-") as directory:
++            runtime = Services(directory, args.model_dir)
++            # This verifies the embedding boundary without needing an external Dedoc server.
++            runtime.parser.parsers[".txt"] = TXTParser()
++            if runtime.embeddings.health().get("ready") is not True:
++                raise RuntimeError("Infinity is not ready or served model ID does not match")
++            context = DocumentContext("smoke-tenant", "smoke-space", "ssl", 1, "ssl.txt")
++            result = runtime.process(Path(__file__).with_name("ssl.txt").read_bytes(), context,
++                                     ProcessingProfile(mode="token"))
++            indexed = runtime.indexer.index(result)
++            started = time.perf_counter()
++            hits = runtime.indexer.search("Как настроить SSL в nginx?", "smoke-tenant", "smoke-space", 50)
++            elapsed_ms = (time.perf_counter() - started) * 1000
++            if not hits or hits[0].payload["document_id"] != "ssl":
++                raise RuntimeError("Indexed document was not retrieved")
++            print(json.dumps({"mode": "REAL external-service smoke (not a benchmark)", "index": indexed,
++                              "collection": collection, "query_total_ms": elapsed_ms,
++                              "hit_ids": [hit.id for hit in hits]}, ensure_ascii=False, indent=2))
++    finally:
++        try:
++            if runtime:
++                # The name is generated above; never target the user's existing collection.
++                if runtime.vectors._collection_ready:
++                    runtime.vectors.request("DELETE", "collections/" + collection)
++        finally:
++            if runtime:
++                runtime.close()
++            if old_collection is None:
++                os.environ.pop("BEAR_QDRANT_COLLECTION", None)
++            else:
++                os.environ["BEAR_QDRANT_COLLECTION"] = old_collection
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/examples/ssl.txt b/examples/ssl.txt
+new file mode 100644
+index 0000000..941eed1
+--- /dev/null
++++ b/examples/ssl.txt
+@@ -0,0 +1,4 @@
++Настройка SSL в nginx
++
++Для HTTPS в nginx укажите пути ssl_certificate и ssl_certificate_key в server-блоке.
++Перед перезагрузкой выполните nginx -t, затем nginx -s reload.
+diff --git a/requirements.verified.txt b/requirements.verified.txt
+new file mode 100644
+index 0000000..c5e6e71
+--- /dev/null
++++ b/requirements.verified.txt
+@@ -0,0 +1,64 @@
++# Observed successful Python 3.12.14 validation environment.
++# Install these, then install local packages with -e; no model weights are included.
++PyYAML==6.0.3
++Pygments==2.21.0
++annotated-doc==0.0.5
++annotated-types==0.8.0
++anyio==4.16.0
++beautifulsoup4==4.15.0
++certifi==2026.10.23
++cffi==2.1.1
++charset-normalizer==3.5.2
++chonkie-core==0.10.2
++chonkie==1.7.0
++click==8.5.0
++coverage==7.17.2
++cryptography==50.0.2
++fastapi==0.162.0
++filelock==4.2.9
++fsspec==2026.9.0
++h11==0.16.0
++hf-xet==1.8.0
++httpcore==1.0.9
++httpx==0.28.1
++huggingface_hub==0.36.2
++idna==3.20
++iniconfig==2.3.1
++lxml==6.1.3
++markdown-it-py==4.2.0
++mdurl==0.1.2
++numpy==2.5.4
++opentelemetry-api==1.45.2
++packaging==26.3
++pdfminer.six==20260107
++pdfplumber==0.11.10
++pillow==13.0.0
++pluggy==1.7.0
++psutil==7.2.2
++pycparser==3.12
++pydantic==2.14.3
++pydantic_core==2.50.4
++pypdfium2==5.14.0
++pytest-cov==7.1.0
++pytest==9.2.0
++python-docx==1.2.0
++python-multipart==0.0.33
++razdel==0.5.0
++regex==2026.9.29
++reportlab==5.1.0
++requests==2.34.2
++ruff==0.12.12
++safetensors==0.8.0
++sentencepiece==0.2.3
++socksio==1.0.0
++soupsieve==4.0.1
++starlette==1.10.0
++tenacity==9.2.1
++tokenizers==0.22.2
++tokie==0.1.4
++tqdm==4.70.1
++transformers==4.57.6
++typing-inspection==0.4.5
++typing_extensions==4.16.0
++urllib3==2.8.0
++uvicorn==0.54.0
+-- 
+2.51.1
+
+
+From 60b75aa65cfda1c225153430273113d9bf0bb85d Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Thu, 5 Nov 2026 23:23:02 +0500
+Subject: [PATCH 2/2] docs: configure target GitHub repository and publication
+ instructions
+
+---
+ PUBLISH_TO_GITHUB.md         |  51 +++++++++++++++++
+ README.md                    | 105 +++++------------------------------
+ README_PARSING.md            |  97 ++++++++++++++++++++++++++++++++
+ docs/embedding/merge_plan.md |  17 +++---
+ docs/embedding/validation.md |   8 +++
+ 5 files changed, 180 insertions(+), 98 deletions(-)
+ create mode 100644 PUBLISH_TO_GITHUB.md
+ create mode 100644 README_PARSING.md
+
+diff --git a/PUBLISH_TO_GITHUB.md b/PUBLISH_TO_GITHUB.md
+new file mode 100644
+index 0000000..dc9eea3
+--- /dev/null
++++ b/PUBLISH_TO_GITHUB.md
+@@ -0,0 +1,51 @@
++# Публикация в andreysokolov-ctrl/bear_embedding
++
++Адрес уже указан: https://github.com/andreysokolov-ctrl/bear_embedding.git.
++Код готов. На 05.11.2026 создание первого файла через подключение отклонено GitHub:
++`403 Resource not accessible by integration`. Репозиторий был пустым; удалённый PR не создан.
++
++## Через подключённое приложение
++
++Разрешить GitHub-подключению доступ к `bear_embedding` в настройках подключения/установки
++приложения. После изменения доступа публикацию можно продолжить. Токены и пароли в чат
++передавать не нужно.
++
++## Обычным git push
++
++Команды ниже рассчитаны на всё ещё пустой репозиторий. Если в нём появились новые commit,
++сначала fetch и проверить историю; force push не использовать.
++
++Распаковать ZIP, открыть терминал в каталоге `BEAR_Embedding`, где находятся README и `transfer/`:
++
++```bash
++git clone -b feature/embedding-pipeline transfer/BEAR_Embedding.bundle bear_embedding
++cd bear_embedding
++git remote rename origin transfer
++git branch main transfer/main
++git remote add origin https://github.com/andreysokolov-ctrl/bear_embedding.git
++git push -u origin main
++git push -u origin feature/embedding-pipeline
++```
++
++Git использует авторизацию вашего компьютера. Пароль аккаунта GitHub не подставлять
++в команды или URL; при необходимости использовать штатное окно менеджера учётных данных.
++
++После успешных push открыть:
++
++https://github.com/andreysokolov-ctrl/bear_embedding/compare/main...feature/embedding-pipeline
++
++Нажать **Create pull request**. Заголовок:
++
++> Добавить EmbeddingPipeline между чанкингом и Qdrant
++
++Описание:
++
++> Добавляет сборку поисковых запросов и пакетную векторизацию готовых чанков через Infinity.
++> Сохраняет ProcessingResult/Chunk, метаданные, профили и фильтры Qdrant.
++> Реализованы проверка токенного бюджета, L2-нормализация, опциональный кэш и IR-метрики.
++> Локальная проверка: 157 тестов прошли, 2 пропущены с указанными причинами.
++> Настоящий инференс и сервер Qdrant проверяются отдельным smoke-test; новый RuBQ-прогон не выполнялся.
++
++`main` будет содержать исходную базу парсинга/чанкинга, а feature-ветка - модуль и интеграцию.
++После проверки PR слияние выполняется отдельно. Git bundle сохраняет исходную Git-историю,
++а не только копию файлов.
+diff --git a/README.md b/README.md
+index e983b45..2703e18 100644
+--- a/README.md
++++ b/README.md
+@@ -1,97 +1,20 @@
+-# BEAR: парсинг документов и чанкинг
++# BEAR Embedding
+ 
+-Экспериментальная сборка для подготовки корпоративных документов к поиску в RAG: извлекает текст и таблицы, делит содержимое на чанки, проверяет покрытие и позволяет посмотреть этапы в локальном демо.
++Класс Python `EmbeddingPipeline`: получение готовых текстовых чанков, сборка поисковых запросов и векторизация через внешний Infinity.
+ 
+-## Библиотеки и компоненты
++Целевой репозиторий: [andreysokolov-ctrl/bear_embedding](https://github.com/andreysokolov-ctrl/bear_embedding).
+ 
+-| Библиотека / компонент | Назначение |
+-|---|---|
+-| **Chonkie 1.7.0** | Семантическое и рекурсивное разбиение текста в составе адаптивного маршрутизатора. |
+-| **Razdel** | Выделение предложений с сохранением исходных подстрок. |
+-| **markdown-it-py** | Разбор Markdown: заголовки, списки, код и таблицы. |
+-| **BeautifulSoup + lxml** | Обход HTML и извлечение элементов и таблиц. |
+-| **Dedoc 2.8** | Разбор DOCX через отдельный процесс и адаптер к общей модели; требуется внешний репозиторий участника. |
+-| **pdfplumber** | Извлечение текста, геометрии и части таблиц PDF. |
+-| **pypdfium2 + Pillow** | Рендеринг страниц PDF для OCR и работа с изображениями. |
+-| **Tesseract OCR** | Внешняя программа для распознавания текста сканов и отдельных областей PDF. |
+-| **transformers + sentencepiece** | Локальный токенизатор E5 и контроль длины входа модели. |
+-| **httpx** | HTTP-клиент сервиса embeddings и Qdrant в базовом пакете. |
+-| **NumPy** | Работа с числовыми массивами при обработке векторов. |
+-| **FastAPI + Pydantic + Uvicorn** | Тестовый HTTP API базового пакета; интерфейс Fusion-демо использует стандартный HTTP-сервер Python. |
+-| **psutil** | Контроль ресурсов процессов локального демо. |
+-| **pytest** | Проверки парсинга, чанкинга и интеграционных контрактов. |
+-| **Infinity / совместимый embedding endpoint** | Внешний инференс для семантического разбиения и векторов; в офлайн-демо используется резервный путь. |
+-| **Qdrant** | Векторное хранилище, для которого есть адаптер в базовом пакете; в Fusion-демо индексация отключена. |
++## Начало работы
+ 
+-Используются два пакета: `bear-text-beta/` — модели данных, маршрутизация, проверка чанков, embedding- и Qdrant-адаптеры; `bear-fusion-lab/` — сборка парсеров, обработка таблиц, PDF/OCR и локальное демо. PDF через Docling проверялся отдельно, но в демо он не подключён.
++- [Установка, использование класса и примеры](README_EMBEDDING.md)
++- [Публикация в GitHub](PUBLISH_TO_GITHUB.md)
++- [Контракты с парсингом, чанкингом и Qdrant](docs/embedding/architecture.md)
++- [Разбор рекомендаций DeepSeek](docs/embedding/deepseek_review.md)
++- [Проверки и их ограничения](docs/embedding/validation.md)
++- [Merge и перенос в GitLab](docs/embedding/merge_plan.md)
++- [Исходный README блока парсинга/чанкинга](README_PARSING.md)
+ 
+-## Архитектура и данные
++Код предыдущего блока сохранён в `bear-text-beta/` и `bear-fusion-lab/`.
++База: [IRelapseIT/BEAR_Chanking-Parsing](https://github.com/IRelapseIT/BEAR_Chanking-Parsing), commit `c2447d4ff89cb0f5e33006d505e6d0243930c292`.
+ 
+-Вход: файл TXT, Markdown, HTML, DOCX или PDF и `DocumentContext` с `tenant_id: str`, `space_id: str`, `document_id: str`, `document_version: int`, `filename: str`, `mime_type: str`, `checksum: str`. Локальное демо создаёт контекст задания самостоятельно.
+-
+-```text
+-Файл + DocumentContext
+-  → проверка файла, лимитов и сохранение оригинала
+-  → парсер по формату → ParsedDocument (упорядоченные ContentBlock)
+-  → нормализация и подготовка таблиц
+-  → adaptive: whole / structural / semantic / recursive
+-  → проверка размеров, покрытия и источников; safe repair при необходимости
+-  → Parent–Child и breadcrumb → ProcessingResult → JSON
+-  → локальный поиск BM25 и просмотр этапов в демо
+-```
+-
+-TXT разбирается встроенным парсером, Markdown — `markdown-it-py`, HTML — BeautifulSoup, DOCX — Dedoc через внешний процесс, PDF — `pdfplumber` с OCR через Tesseract по необходимости. `ParsedDocument` содержит `context`, `blocks`, `attachments`, `warnings` и профиль парсера. Каждый `ContentBlock` имеет тип `TEXT`, `TABLE` или `IMAGE`, роль, текст, порядок, путь раздела, `SourceLocator` и метаданные. Источник может содержать строки, путь элемента, страницу и координаты; точность зависит от парсера.
+-
+-Таблицы переводятся в канонические ячейки с координатами и объединениями. Ячейки одной строки объединяются, если помещаются в токенный бюджет; длинные значения делятся на части. Валидатор проверяет покрытие значений и привязку к заголовкам.
+-
+-Адаптивный маршрутизатор сохраняет небольшой участок целиком, использует структурное разбиение для явно структурированного содержимого, семантическое — для подходящего связного текста, рекурсивное — как основной альтернативный и резервный путь. При недоступном инференсе семантическое разбиение переходит на резерв. Финальная проверка контролирует вход модели с учётом контекста; стандартный профиль: цель 320, максимум 480 токенов.
+-
+-Выход `FusionPipeline.process_path(...)` — JSON-совместимый словарь с `schema_version`, `original`, `parser_runtime`, `result`, `quality`, `parents` и `accepted_for_indexing`. В `result` находятся `context`, `processing_profile_id`, `generation_id`, `parsed_document`, `chunks`, `deferred_blocks`, `warnings`, `completeness` и `metrics`.
+-
+-Пример одного элемента `chunks` (сокращённый):
+-
+-```json
+-{
+-  "id": "uuid", "sequence": 0,
+-  "text": "Текст фрагмента", "embedding_text": "Раздел\nТекст фрагмента",
+-  "token_count": 15, "section_path": ["Раздел"],
+-  "source_spans": [{"block_id": "block-id", "start_char": 0, "end_char": 16}],
+-  "attachment_ids": [], "strategy": "structural", "fallback_reason": null,
+-  "metadata": {"parent_id": "uuid", "parent_ids": ["uuid"], "chunk_order": 0, "breadcrumb": "Раздел"}
+-}
+-```
+-
+-Это пример формы: фактические текст, идентификаторы, границы, стратегия и размер зависят от документа и профиля. `source_spans` — полуоткрытые диапазоны символов внутри нормализованного блока. `partial` и предупреждения указывают на неполную обработку; прохождение проверки чанков не гарантирует правильность OCR или исходного парсинга.
+-
+-## Запуск и зависимости окружения
+-
+-Fusion рассчитан на Python 3.12. Помимо Python-пакетов нужны локальный токенизатор `intfloat/multilingual-e5-small`, Tesseract с `eng` и `rus` для OCR и отдельное окружение Python с Dedoc для DOCX. Модели, виртуальные окружения, документы и результаты пользователей в репозиторий не включены.
+-
+-На Windows из корня репозитория:
+-
+-```powershell
+-py -3.12 -m venv bear-text-beta/.venv
+-./bear-text-beta/.venv/Scripts/python.exe -m pip install -e './bear-text-beta[dev]'
+-./bear-text-beta/.venv/Scripts/python.exe -m pip install -e './bear-fusion-lab[demo]'
+-```
+-
+-Для DOCX требуется чистая копия [RAG_VERSION_1](https://github.com/tema-coder/RAG_VERSION_1) на commit `a48d88d21ba6ece0fc37eb1f91f18905705dec7f` и отдельный Python с установленными зависимостями парсера. Worker проверяет commit и отсутствие изменений отслеживаемых файлов. Подготовьте локальный токенизатор E5; пути к нему, репозиторию и Python указываются явно:
+-
+-```powershell
+-./bear-text-beta/.venv/Scripts/python.exe ./bear-fusion-lab/demo.py `
+-  --upstream 'ПУТЬ_К_RAG_VERSION_1' `
+-  --parser-python 'ПУТЬ_К_PYTHON_ПАРСЕРА' `
+-  --tokenizer 'ПУТЬ_К_ТОКЕНИЗАТОРУ_E5'
+-```
+-
+-Откройте http://127.0.0.1:8765 и загрузите документ. Без embedding endpoint семантический путь использует fallback. Для совместимого сервиса задайте `BEAR_INFINITY_URL` до запуска. Скрипт `bear-fusion-lab/start-demo.ps1` содержит пути прежнего рабочего окружения; для другого компьютера используйте аргументы выше. Полная установка отдельного окружения парсера и запуск с нуля на другой машине пока не подтверждены.
+-
+-## Ограничения и проверки
+-
+-Fusion — бета: `accepted_for_indexing=false`, локальный поиск — BM25, генерация ответов и работающий сквозной Qdrant-пайплайн в демо не реализованы. Качество сложных PDF-таблиц, рисунков и чисел OCR требует проверки. Семантическое разбиение с реальными E5-векторами проверено на небольшой контрольной выборке; это не оценка качества на всех документах.
+-
+-Исходный отчёт о тестах и сравнении версий — [FINAL_INTEGRATION_REPORT.md](bear-fusion-lab/FINAL_INTEGRATION_REPORT.md). Часть исследовательских скриптов и корпусов из исходного рабочего окружения в эту публикацию не включена; ссылки отчёта на них могут быть недоступны.
+-# Модуль эмбеддинга
+-
+-Класс `EmbeddingPipeline`, интеграция с этим блоком, примеры запуска и подготовка переноса:
+-[README_EMBEDDING.md](README_EMBEDDING.md).
++Ветка реализации: `feature/embedding-pipeline`; `main` в Git bundle содержит исходную базу для проверки и слияния через PR.
+diff --git a/README_PARSING.md b/README_PARSING.md
+new file mode 100644
+index 0000000..e983b45
+--- /dev/null
++++ b/README_PARSING.md
+@@ -0,0 +1,97 @@
++# BEAR: парсинг документов и чанкинг
++
++Экспериментальная сборка для подготовки корпоративных документов к поиску в RAG: извлекает текст и таблицы, делит содержимое на чанки, проверяет покрытие и позволяет посмотреть этапы в локальном демо.
++
++## Библиотеки и компоненты
++
++| Библиотека / компонент | Назначение |
++|---|---|
++| **Chonkie 1.7.0** | Семантическое и рекурсивное разбиение текста в составе адаптивного маршрутизатора. |
++| **Razdel** | Выделение предложений с сохранением исходных подстрок. |
++| **markdown-it-py** | Разбор Markdown: заголовки, списки, код и таблицы. |
++| **BeautifulSoup + lxml** | Обход HTML и извлечение элементов и таблиц. |
++| **Dedoc 2.8** | Разбор DOCX через отдельный процесс и адаптер к общей модели; требуется внешний репозиторий участника. |
++| **pdfplumber** | Извлечение текста, геометрии и части таблиц PDF. |
++| **pypdfium2 + Pillow** | Рендеринг страниц PDF для OCR и работа с изображениями. |
++| **Tesseract OCR** | Внешняя программа для распознавания текста сканов и отдельных областей PDF. |
++| **transformers + sentencepiece** | Локальный токенизатор E5 и контроль длины входа модели. |
++| **httpx** | HTTP-клиент сервиса embeddings и Qdrant в базовом пакете. |
++| **NumPy** | Работа с числовыми массивами при обработке векторов. |
++| **FastAPI + Pydantic + Uvicorn** | Тестовый HTTP API базового пакета; интерфейс Fusion-демо использует стандартный HTTP-сервер Python. |
++| **psutil** | Контроль ресурсов процессов локального демо. |
++| **pytest** | Проверки парсинга, чанкинга и интеграционных контрактов. |
++| **Infinity / совместимый embedding endpoint** | Внешний инференс для семантического разбиения и векторов; в офлайн-демо используется резервный путь. |
++| **Qdrant** | Векторное хранилище, для которого есть адаптер в базовом пакете; в Fusion-демо индексация отключена. |
++
++Используются два пакета: `bear-text-beta/` — модели данных, маршрутизация, проверка чанков, embedding- и Qdrant-адаптеры; `bear-fusion-lab/` — сборка парсеров, обработка таблиц, PDF/OCR и локальное демо. PDF через Docling проверялся отдельно, но в демо он не подключён.
++
++## Архитектура и данные
++
++Вход: файл TXT, Markdown, HTML, DOCX или PDF и `DocumentContext` с `tenant_id: str`, `space_id: str`, `document_id: str`, `document_version: int`, `filename: str`, `mime_type: str`, `checksum: str`. Локальное демо создаёт контекст задания самостоятельно.
++
++```text
++Файл + DocumentContext
++  → проверка файла, лимитов и сохранение оригинала
++  → парсер по формату → ParsedDocument (упорядоченные ContentBlock)
++  → нормализация и подготовка таблиц
++  → adaptive: whole / structural / semantic / recursive
++  → проверка размеров, покрытия и источников; safe repair при необходимости
++  → Parent–Child и breadcrumb → ProcessingResult → JSON
++  → локальный поиск BM25 и просмотр этапов в демо
++```
++
++TXT разбирается встроенным парсером, Markdown — `markdown-it-py`, HTML — BeautifulSoup, DOCX — Dedoc через внешний процесс, PDF — `pdfplumber` с OCR через Tesseract по необходимости. `ParsedDocument` содержит `context`, `blocks`, `attachments`, `warnings` и профиль парсера. Каждый `ContentBlock` имеет тип `TEXT`, `TABLE` или `IMAGE`, роль, текст, порядок, путь раздела, `SourceLocator` и метаданные. Источник может содержать строки, путь элемента, страницу и координаты; точность зависит от парсера.
++
++Таблицы переводятся в канонические ячейки с координатами и объединениями. Ячейки одной строки объединяются, если помещаются в токенный бюджет; длинные значения делятся на части. Валидатор проверяет покрытие значений и привязку к заголовкам.
++
++Адаптивный маршрутизатор сохраняет небольшой участок целиком, использует структурное разбиение для явно структурированного содержимого, семантическое — для подходящего связного текста, рекурсивное — как основной альтернативный и резервный путь. При недоступном инференсе семантическое разбиение переходит на резерв. Финальная проверка контролирует вход модели с учётом контекста; стандартный профиль: цель 320, максимум 480 токенов.
++
++Выход `FusionPipeline.process_path(...)` — JSON-совместимый словарь с `schema_version`, `original`, `parser_runtime`, `result`, `quality`, `parents` и `accepted_for_indexing`. В `result` находятся `context`, `processing_profile_id`, `generation_id`, `parsed_document`, `chunks`, `deferred_blocks`, `warnings`, `completeness` и `metrics`.
++
++Пример одного элемента `chunks` (сокращённый):
++
++```json
++{
++  "id": "uuid", "sequence": 0,
++  "text": "Текст фрагмента", "embedding_text": "Раздел\nТекст фрагмента",
++  "token_count": 15, "section_path": ["Раздел"],
++  "source_spans": [{"block_id": "block-id", "start_char": 0, "end_char": 16}],
++  "attachment_ids": [], "strategy": "structural", "fallback_reason": null,
++  "metadata": {"parent_id": "uuid", "parent_ids": ["uuid"], "chunk_order": 0, "breadcrumb": "Раздел"}
++}
++```
++
++Это пример формы: фактические текст, идентификаторы, границы, стратегия и размер зависят от документа и профиля. `source_spans` — полуоткрытые диапазоны символов внутри нормализованного блока. `partial` и предупреждения указывают на неполную обработку; прохождение проверки чанков не гарантирует правильность OCR или исходного парсинга.
++
++## Запуск и зависимости окружения
++
++Fusion рассчитан на Python 3.12. Помимо Python-пакетов нужны локальный токенизатор `intfloat/multilingual-e5-small`, Tesseract с `eng` и `rus` для OCR и отдельное окружение Python с Dedoc для DOCX. Модели, виртуальные окружения, документы и результаты пользователей в репозиторий не включены.
++
++На Windows из корня репозитория:
++
++```powershell
++py -3.12 -m venv bear-text-beta/.venv
++./bear-text-beta/.venv/Scripts/python.exe -m pip install -e './bear-text-beta[dev]'
++./bear-text-beta/.venv/Scripts/python.exe -m pip install -e './bear-fusion-lab[demo]'
++```
++
++Для DOCX требуется чистая копия [RAG_VERSION_1](https://github.com/tema-coder/RAG_VERSION_1) на commit `a48d88d21ba6ece0fc37eb1f91f18905705dec7f` и отдельный Python с установленными зависимостями парсера. Worker проверяет commit и отсутствие изменений отслеживаемых файлов. Подготовьте локальный токенизатор E5; пути к нему, репозиторию и Python указываются явно:
++
++```powershell
++./bear-text-beta/.venv/Scripts/python.exe ./bear-fusion-lab/demo.py `
++  --upstream 'ПУТЬ_К_RAG_VERSION_1' `
++  --parser-python 'ПУТЬ_К_PYTHON_ПАРСЕРА' `
++  --tokenizer 'ПУТЬ_К_ТОКЕНИЗАТОРУ_E5'
++```
++
++Откройте http://127.0.0.1:8765 и загрузите документ. Без embedding endpoint семантический путь использует fallback. Для совместимого сервиса задайте `BEAR_INFINITY_URL` до запуска. Скрипт `bear-fusion-lab/start-demo.ps1` содержит пути прежнего рабочего окружения; для другого компьютера используйте аргументы выше. Полная установка отдельного окружения парсера и запуск с нуля на другой машине пока не подтверждены.
++
++## Ограничения и проверки
++
++Fusion — бета: `accepted_for_indexing=false`, локальный поиск — BM25, генерация ответов и работающий сквозной Qdrant-пайплайн в демо не реализованы. Качество сложных PDF-таблиц, рисунков и чисел OCR требует проверки. Семантическое разбиение с реальными E5-векторами проверено на небольшой контрольной выборке; это не оценка качества на всех документах.
++
++Исходный отчёт о тестах и сравнении версий — [FINAL_INTEGRATION_REPORT.md](bear-fusion-lab/FINAL_INTEGRATION_REPORT.md). Часть исследовательских скриптов и корпусов из исходного рабочего окружения в эту публикацию не включена; ссылки отчёта на них могут быть недоступны.
++# Модуль эмбеддинга
++
++Класс `EmbeddingPipeline`, интеграция с этим блоком, примеры запуска и подготовка переноса:
++[README_EMBEDDING.md](README_EMBEDDING.md).
+diff --git a/docs/embedding/merge_plan.md b/docs/embedding/merge_plan.md
+index 77596ba..d359521 100644
+--- a/docs/embedding/merge_plan.md
++++ b/docs/embedding/merge_plan.md
+@@ -12,10 +12,13 @@
+ - Тест RSS experimental demo пропускается, если psutil не видит процессы в среде;
+   в обычной ОС проверка по-прежнему выполняется. Production-логика лимитов не менялась.
+ 
+-Название/URL «текущего» репозитория не были предоставлены. Поэтому пакет готов к проверке
+-и переносу, но слияние с неизвестной целевой историей и разрешение её конфликтов не заявляются.
+-В подключённом GitHub у `IRelapseIT/BEAR_Chanking-Parsing` есть только read-доступ;
+-доступный для записи `Golang` к BEAR не относится и не изменялся.
++Целевой репозиторий получен: `https://github.com/andreysokolov-ctrl/bear_embedding.git`.
++При проверке 05.11.2026 он был пустым. GitHub подтвердил права владельца аккаунта,
++но запись через подключение отклонил: `403 Resource not accessible by integration`.
++Удалённых commit/ветки/PR пока нет. Для публикации нужно разрешить приложению доступ
++к этому репозиторию либо выполнить обычный git push от своего аккаунта.
++Точные команды с уже подставленным адресом: [PUBLISH_TO_GITHUB.md](../../PUBLISH_TO_GITHUB.md).
++История upstream и feature-ветка полностью сохранены в bundle.
+ 
+ ## Существующий BEAR на GitHub или GitLab
+ 
+@@ -49,12 +52,12 @@ git clone transfer/BEAR_Embedding.bundle BEAR-Embedding
+ cd BEAR-Embedding
+ git remote rename origin transfer
+ git branch main transfer/main
+-git remote add origin https://github.com/OWNER/BEAR-Embedding.git
++git remote add origin https://github.com/andreysokolov-ctrl/bear_embedding.git
+ git push origin main
+ git push -u origin feature/embedding-pipeline
+ ```
+ 
+-`OWNER` заменить своим логином; URL GitLab задаётся аналогично. Это обычный push, без force.
++Для GitLab заменить URL на адрес целевого проекта. Это обычный push, без force.
+ В `main` находится исходная база, реализация - в feature-ветке. Затем открыть PR/MR
+ `feature/embedding-pipeline -> main`. Обе ветки входят в bundle. Рекомендованное название MR:
+ `Добавить EmbeddingPipeline между чанкингом и Qdrant`.
+@@ -82,4 +85,4 @@ GitLab Project Export - отдельный архив, формируемый с
+ Сверить фактическую схему основного GitLab и способ DI, запустить Infinity/Qdrant smoke,
+ проверить ту же ревизию весов и токенизатора, затем прогнать RuBQ с неизменными qrels.
+ Статусы экспериментального Fusion не переводить в accepted без проверки source fidelity.
+-Публикация и фактический MR требуют конкретного целевого URL и write-доступа.
++Публикация и фактический PR ожидают разрешения на запись через GitHub-подключение; целевой URL уже известен.
+diff --git a/docs/embedding/validation.md b/docs/embedding/validation.md
+index cc442e0..b35c970 100644
+--- a/docs/embedding/validation.md
++++ b/docs/embedding/validation.md
+@@ -58,3 +58,11 @@ HTTP-контрактные тесты проходят; миграция upstre
+ Архив содержит Git bundle и patch для воспроизводимого переноса.
+ Запуски pytest сохранены в `transfer/validation/` архива. Bundle восстанавливается локально,
+ его feature-дерево сравнивается с исходниками, patch применяется к исходной базе без конфликтов.
++
++## Публикация
++
++Целевой GitHub: `andreysokolov-ctrl/bear_embedding`, на момент проверки пустой.
++Попытка создания первого файла отклонена GitHub с HTTP 403
++`Resource not accessible by integration`. Это ограничение подключения,
++а не результат тестов кода. Удалённые CI и PR пока отсутствуют.
++Последующая правка добавила адрес публикации и документацию; Python-код не менялся.
+-- 
+2.51.1
+
