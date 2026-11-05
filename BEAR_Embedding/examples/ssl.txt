@@ -1,0 +1,4 @@
+Настройка SSL в nginx
+
+Для HTTPS в nginx укажите пути ssl_certificate и ssl_certificate_key в server-блоке.
+Перед перезагрузкой выполните nginx -t, затем nginx -s reload.

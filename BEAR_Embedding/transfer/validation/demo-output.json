@@ -1,0 +1,67 @@
+{
+  "mode": "MOCK: contract demo, not retrieval quality",
+  "chunks": 1,
+  "dimension": 4,
+  "original_query": "  Как\n настроить SSL?  ",
+  "prepared_query": "Как настроить SSL?",
+  "sample_embedded_chunk": {
+    "chunk": {
+      "id": "9bf9988d-d23b-5cb4-bc4d-e3be1a14bcfa",
+      "sequence": 0,
+      "text": "Настройка SSL в nginx\n\nДля HTTPS в nginx укажите пути ssl_certificate и ssl_certificate_key в server-блоке.\nПеред перезагрузкой выполните nginx -t, затем nginx -s reload.",
+      "embedding_text": "Настройка SSL в nginx\n\nДля HTTPS в nginx укажите пути ssl_certificate и ssl_certificate_key в server-блоке.\nПеред перезагрузкой выполните nginx -t, затем nginx -s reload.",
+      "token_count": 181,
+      "source_spans": [
+        {
+          "block_id": "56546c6a-3726-52fd-a70b-384f3ac3963c",
+          "start_char": 0,
+          "end_char": 21
+        },
+        {
+          "block_id": "3a6e59bd-14b7-5637-a3fa-5592decf0785",
+          "start_char": 0,
+          "end_char": 147
+        }
+      ],
+      "section_path": [],
+      "attachment_ids": [],
+      "strategy": "recursive",
+      "fallback_reason": null,
+      "metadata": {}
+    },
+    "vector": [
+      0.6,
+      0.8,
+      0.0,
+      0.0
+    ],
+    "embedding_profile_id": "870839a77d5a68a6c55c"
+  },
+  "events": [
+    {
+      "purpose": "document",
+      "input_count": 1,
+      "cache_hits": 0,
+      "inferred_count": 1,
+      "elapsed_ms": 2.6650909999261785,
+      "embedding_profile_id": "870839a77d5a68a6c55c"
+    },
+    {
+      "purpose": "query",
+      "input_count": 1,
+      "cache_hits": 0,
+      "inferred_count": 1,
+      "elapsed_ms": 0.4165820000707754,
+      "embedding_profile_id": "870839a77d5a68a6c55c"
+    },
+    {
+      "purpose": "query",
+      "input_count": 1,
+      "cache_hits": 1,
+      "inferred_count": 0,
+      "elapsed_ms": 0.03630800028986414,
+      "embedding_profile_id": "870839a77d5a68a6c55c"
+    }
+  ],
+  "http_requests": 2
+}
